@@ -84,6 +84,24 @@ namespace ChillPatcher.JSApi
         }
 
         /// <summary>
+        /// 以 base64 读取二进制文件（供 JS 端加载背景图等资源，路径同样限制在插件目录内）
+        /// </summary>
+        public string readBase64(string relativePath)
+        {
+            try
+            {
+                var fullPath = ResolveSafePath(relativePath);
+                if (fullPath == null || !File.Exists(fullPath)) return null;
+                return Convert.ToBase64String(File.ReadAllBytes(fullPath));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning($"[IO] readBase64 failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
         /// 列出目录下的文件
         /// </summary>
         public string listFiles(string relativePath)

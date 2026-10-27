@@ -34,7 +34,7 @@ namespace ChillPatcher.Patches.UIFramework
         /// </summary>
         [HarmonyPatch(typeof(GameAudioInfo), "DownloadAudioFile")]
         [HarmonyPrefix]
-        static bool DownloadAudioFile_Prefix(string uri, CancellationToken ct, ref UniTask<(AudioClip, string, string)> __result)
+        static bool DownloadAudioFile_Prefix(string uri, CancellationToken ct, ref UniTask<GameAudioInfo.LocalAudioLoadResult> __result)
         {
             var ext = Path.GetExtension(uri)?.ToLower();
             
@@ -54,19 +54,28 @@ namespace ChillPatcher.Patches.UIFramework
             if (!_nativeDecoderAvailable)
             {
                 Plugin.Log.LogError($"[FlacDecoder] Cannot stream FLAC: Native decoder unavailable");
-                __result = UniTask.FromResult<(AudioClip, string, string)>((null, "", ""));
+                __result = UniTask.FromResult(new GameAudioInfo.LocalAudioLoadResult(null, "", "", null));
                 return false;
             }
 
-            __result = CreateStreamingFlacClip(uri, ct);
+            __result = CreateStreamingFlacLoadResult(uri, ct);
             return false; // 使用我们的流式实现
         }
 
         /// <summary>
         /// 创建流式 FLAC AudioClip
         /// </summary>
+        // Match the installed game's return type; retain the existing custom FLAC reader ownership.
+        private static async UniTask<GameAudioInfo.LocalAudioLoadResult> CreateStreamingFlacLoadResult(string filePath, CancellationToken ct)
+        {
+            var result = await CreateStreamingFlacClip(filePath, ct);
+            return new GameAudioInfo.LocalAudioLoadResult(result.Item1, result.Item2, result.Item3, null);
+        }
+
         private static async UniTask<(AudioClip, string, string)> CreateStreamingFlacClip(string filePath, CancellationToken ct)
         {
+            FlacDecoder.FlacStreamReader streamReader = null;
+            bool transferred = false;
             try
             {
                 if (!File.Exists(filePath))
@@ -75,13 +84,12 @@ namespace ChillPatcher.Patches.UIFramework
                     return (null, "", "");
                 }
 
-                FlacDecoder.FlacStreamReader streamReader = null;
                 string title = Path.GetFileNameWithoutExtension(filePath);
 
                 // 在后台线程打开流
                 await UniTask.RunOnThreadPool(() =>
                 {
-                    streamReader = new FlacDecoder.FlacStreamReader(filePath);
+                    streamReader = new FlacDecoder.FlacStreamReader(filePath, ct);
                 }, cancellationToken: ct);
 
                 if (streamReader == null)
@@ -95,6 +103,7 @@ namespace ChillPatcher.Patches.UIFramework
                 // 在主线程创建流式 AudioClip
                 AudioClip clip = null;
                 await UniTask.SwitchToMainThread();
+                ct.ThrowIfCancellationRequested();
                 clip = CreateStreamingAudioClip(streamReader, clipName);
 
                 if (clip == null)
@@ -105,6 +114,7 @@ namespace ChillPatcher.Patches.UIFramework
 
                 // 暂存 streamReader，等待 LoadLocalFile 中注册到 AudioResourceManager
                 _pendingStreamReaders[clip.GetInstanceID()] = streamReader;
+                transferred = true;
 
                 Plugin.Log.LogInfo($"[FlacStreamLoader] ✅ Created streaming clip: {clipName} ({streamReader.SampleRate}Hz, {streamReader.Channels}ch)");
                 
@@ -114,6 +124,10 @@ namespace ChillPatcher.Patches.UIFramework
             {
                 Plugin.Log.LogError($"[FlacStreamLoader] Exception: {ex}");
                 return (null, "", "");
+            }
+            finally
+            {
+                if (!transferred) streamReader?.Dispose();
             }
         }
 
@@ -272,7 +286,7 @@ namespace ChillPatcher.Patches.UIFramework
             instance.LocalPath = filepath;
             
             var result = await GameAudioInfo.DownloadAudioFile(filepath, ct);
-            var clip = result.Item1;
+            var clip = result.Clip;
             
             if (clip == null)
             {
@@ -299,7 +313,7 @@ namespace ChillPatcher.Patches.UIFramework
             else
             {
                 // 如果原来没有标题，使用 DownloadAudioFile 返回的或文件名
-                var downloadedTitle = result.Item2;
+                var downloadedTitle = result.Title;
                 instance.Title = string.IsNullOrEmpty(downloadedTitle) 
                     ? Path.GetFileNameWithoutExtension(filepath) 
                     : downloadedTitle;

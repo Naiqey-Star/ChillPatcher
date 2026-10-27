@@ -36,6 +36,221 @@ namespace ChillPatcher
         /// <summary>preedit 期间锁定位置，避免候选窗跟随光标跳动</summary>
         private static bool _positionLocked;
 
+        /// <summary>上次获焦的 TextField 及其时间，仅用于本次操作后的局部恢复。</summary>
+        private static TextField _lastTextField;
+        private static float _lastTextFieldAt;
+
+        /// <summary>
+        /// 把回车派发给当前获焦的 UIToolkit TextField（OneJS 输入框），
+        /// 由页面自身的 onKeyDown 决定发送，C# 不重复实现聊天逻辑。
+        /// </summary>
+        internal static bool DispatchReturn()
+        {
+            var tf = ResolveTargetTextField();
+            if (tf == null) return false;
+
+            // 焦点落在内层编辑元素（等同点击输入框），事件本身发给 TextField，
+            // 这样只触发页面自己的 onKeyDown，不会先被内层输入控件当成换行处理。
+            var editor = (tf.Q<VisualElement>(TextFieldInputName) ?? (VisualElement)tf);
+            editor.Focus();
+            if (!TrySendKeyDownTo(tf as VisualElement, false))
+                return false;
+
+            RememberTextField(tf);
+            return true;
+        }
+
+        /// <summary>
+        /// Shift+回车：直接在光标处插入换行（有选区时替换选区），
+        /// 不再依赖合成事件的默认行为，保证“换行一次、光标停在换行之后”。
+        /// </summary>
+        internal static bool InsertNewline()
+        {
+            var tf = ResolveTargetTextField();
+            if (tf == null) return false;
+            // 单行输入框（如配置项）不插入换行，避免把值弄脏
+            if (!tf.multiline)
+            {
+                RememberTextField(tf);
+                return true;
+            }
+            try
+            {
+                InsertTextAtCursor(tf, "\n");
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"[UIToolkitInput] InsertNewline error: {ex.Message}");
+                return false;
+            }
+            RememberTextField(tf);
+            return true;
+        }
+
+        private const string TextFieldInputName = "unity-text-input";
+
+        /// <summary>
+        /// 解析本次回车/换行的目标输入框：优先当前焦点，
+        /// 其次扫描各面板焦点，最后回退到“刚刚还在用的那个输入框”（元素仍存活时）。
+        /// 这样发送一次之后即使焦点瞬间抖动，下一次回车也不会被丢掉。
+        /// </summary>
+        // UGUI and UI Toolkit have independent focus systems. A native input
+        // taking focus must invalidate the chat fallback before any dispatch.
+        private static bool YieldToNativeInput()
+        {
+            var selected = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
+            if (selected == null) return false;
+            var tmp = selected.GetComponentInParent<TMPro.TMP_InputField>();
+            var legacy = selected.GetComponentInParent<UnityEngine.UI.InputField>();
+            bool nativeFocused = (tmp != null && tmp.isActiveAndEnabled && tmp.isFocused)
+                || (legacy != null && legacy.isActiveAndEnabled && legacy.isFocused);
+            if (!nativeFocused) return false;
+            OnInputCaptureLost();
+            return true;
+        }
+
+        private static TextField ResolveTargetTextField()
+        {
+            if (YieldToNativeInput()) return null;
+            var tf = _currentFocusedTextField;
+            if (tf != null && (tf as VisualElement)?.panel == null) tf = null;
+            if (tf == null) tf = FindFocusedTextField();
+            if (tf == null)
+            {
+                // 仅在“刚刚还在用这个输入框”的短窗口内回退，避免抢走用户后来切换的焦点
+                var last = _lastTextField;
+                if (last != null && (last as VisualElement)?.panel != null &&
+                    UnityEngine.Time.unscaledTime - _lastTextFieldAt <= 2f)
+                    tf = last;
+            }
+            return tf;
+        }
+
+        private static void RememberTextField(TextField tf)
+        {
+            _lastTextField = tf;
+            _lastTextFieldAt = UnityEngine.Time.unscaledTime;
+            _diagnoseFocusAt = UnityEngine.Time.unscaledTime + 1f;
+        }
+
+        /// <summary>
+        /// 前台切到别的应用时调用：取消残留的焦点恢复，并主动释放 UI 焦点，
+        /// 让输入焦点自然回到用户正在用的窗口，而不是继续留在壁纸层。
+        /// </summary>
+        internal static void OnInputCaptureLost()
+        {
+            _lastTextField = null;
+            _lastTextFieldAt = 0f;
+            _diagnoseFocusAt = 0f;
+            _lastTextFieldRect = null;
+            _positionLocked = false;
+            _currentFocusedTextField = null;
+            IsUIToolkitTextFieldFocused = false;
+            try { BlurAllPanels(); }
+            catch (Exception ex) { _log?.LogWarning($"[UIToolkitInput] blur on capture lost: {ex.Message}"); }
+        }
+
+        /// <summary>扫描各 OneJS 面板的焦点，返回其中获焦的 TextField（无则 null）。</summary>
+        private static TextField FindFocusedTextField()
+        {
+            foreach (var kv in OneJSBridge.Instances)
+            {
+                var inst = kv.Value;
+                if (inst == null || !inst.Enabled || !inst.IsInitialized) continue;
+
+                var root = inst.Engine?.GetComponent<UIDocument>()?.rootVisualElement;
+                var focused = root?.panel?.focusController?.focusedElement;
+                var tf = FindTextField(focused);
+                if (tf != null) return tf;
+            }
+            return null;
+        }
+
+        /// <summary>向元素派发一个 Return 按键事件（真实 UIToolkit 事件，会走页面 onKeyDown）。</summary>
+        private static bool TrySendKeyDownTo(VisualElement ve, bool shift)
+        {
+            if (ve == null || ve.panel == null) return false;
+            try
+            {
+                using (var evt = KeyDownEvent.GetPooled('\n', KeyCode.Return,
+                    shift ? EventModifiers.Shift : EventModifiers.None))
+                {
+                    evt.target = ve;
+                    ve.SendEvent(evt);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"[UIToolkitInput] DispatchReturn error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>诊断：回车后 1 秒仍无焦点时，记录一次各面板焦点状态（有界，仅一次）。</summary>
+        private static float _diagnoseFocusAt;
+
+        private static void DiagnoseFocusIfDue()
+        {
+            if (_diagnoseFocusAt <= 0f) return;
+            if (UnityEngine.Time.unscaledTime < _diagnoseFocusAt) return;
+            _diagnoseFocusAt = 0f;
+
+            var sb = new System.Text.StringBuilder("[AIChatFocus] after-enter:");
+            foreach (var kv in OneJSBridge.Instances)
+            {
+                var doc = kv.Value?.Engine?.UIDocument;
+                var panel = doc?.rootVisualElement?.panel;
+                var focused = panel?.focusController?.focusedElement;
+                sb.Append(' ').Append(kv.Key).Append('=')
+                  .Append(focused == null ? "null" : focused.GetType().Name);
+            }
+            var es = UnityEngine.EventSystems.EventSystem.current;
+            sb.Append(" eventSystem=").Append(es == null ? "null"
+                : (es.currentSelectedGameObject == null ? "none" : es.currentSelectedGameObject.name));
+            _log?.LogInfo(sb.ToString());
+        }
+
+        /// <summary>
+        /// 局部焦点恢复：只在“刚才还有 TextField 获焦、随即丢失”的短时间内把焦点放回同一元素，
+        /// 元素已被销毁则放弃；用户主动点击其它地方超过窗口期后不再干预。
+        /// </summary>
+        private static void FocusKeeper()
+        {
+            if (YieldToNativeInput()) return;
+            DiagnoseFocusIfDue();
+            if (_lastTextField == null) return;
+
+            // 前台已经不归我们（用户切到别的窗口/点了别的应用）时绝不抢焦点
+            if (!KeyboardHookPatch.IsCaptureTargetActive())
+            {
+                _lastTextField = null;
+                return;
+            }
+
+            if (UnityEngine.Time.unscaledTime - _lastTextFieldAt > 2f)
+            {
+                _lastTextField = null;
+                return;
+            }
+            try
+            {
+                var tf = _lastTextField;
+                if ((tf as VisualElement)?.panel == null)
+                {
+                    _lastTextField = null;
+                    return;
+                }
+                // 焦点要落在内层编辑元素上，Equals 点击输入框后的状态
+                var editor = tf.Q<VisualElement>(TextFieldInputName) ?? (VisualElement)tf;
+                if (editor.panel != null && editor.focusController?.focusedElement != editor)
+                    editor.Focus();
+            }
+            catch
+            {
+                _lastTextField = null;
+            }
+        }
         public static void Initialize(ManualLogSource log)
         {
             _log = log;
@@ -125,8 +340,19 @@ namespace ChillPatcher
         /// </summary>
         public static void Tick()
         {
+            // 先判前台归属：切到别的应用时立刻释放，后续不再往壁纸层塞输入
+            KeyboardHookPatch.RefreshCaptureState();
+
             IsUIToolkitTextFieldFocused = false;
             _currentFocusedTextField = null;
+
+            // Yield before scanning OneJS panels: their cached focus can remain
+            // set even after EventSystem has activated a native input field.
+            if (YieldToNativeInput())
+            {
+                CheckAndEmitImeContextChanged();
+                return;
+            }
 
             if (!OneJSBridge.IsInitialized) return;
 
@@ -145,6 +371,8 @@ namespace ChillPatcher
                 {
                     IsUIToolkitTextFieldFocused = true;
                     _currentFocusedTextField = tf;
+                    _lastTextField = tf;
+                    _lastTextFieldAt = UnityEngine.Time.unscaledTime;
 
                     // 缓存 TextField 的面板坐标（preedit 锁定期间不更新）
                     if (!_positionLocked)
@@ -162,6 +390,7 @@ namespace ChillPatcher
 
             // 无 TextField 获焦时清除缓存
             _lastTextFieldRect = null;
+            FocusKeeper();
             CheckAndEmitImeContextChanged();
         }
 
@@ -380,10 +609,46 @@ namespace ChillPatcher
                 cursor = start;
             }
 
-            tf.value = curText.Insert(cursor, text);
-            int newPos = cursor + text.Length;
-            tf.cursorIndex = newPos;
-            tf.selectIndex = newPos;
+            SetTextAndCaret(tf, curText.Insert(cursor, text), cursor + text.Length);
+        }
+
+        /// <summary>
+        /// 写入文本并同步给 JS 层。
+        /// B 窗口是受控输入框（value={prompt}），只改原生 value 的话 Preact 状态会滞后，
+        /// 导致下次发送读到旧文本，因此这里补发一次 ChangeEvent 让两边一致。
+        /// </summary>
+        private static void SetTextAndCaret(TextField tf, string newText, int caret)
+        {
+            string oldText = tf.value ?? "";
+            if (!string.Equals(oldText, newText, StringComparison.Ordinal))
+            {
+                tf.value = newText;
+                if (!string.Equals(tf.value ?? "", newText, StringComparison.Ordinal))
+                    tf.SetValueWithoutNotify(newText);
+                NotifyTextChanged(tf, oldText, newText);
+            }
+
+            int max = (tf.value ?? "").Length;
+            if (caret < 0) caret = 0;
+            if (caret > max) caret = max;
+            tf.cursorIndex = caret;
+            tf.selectIndex = caret;
+        }
+
+        private static void NotifyTextChanged(TextField tf, string oldText, string newText)
+        {
+            try
+            {
+                using (var evt = ChangeEvent<string>.GetPooled(oldText, newText))
+                {
+                    evt.target = tf;
+                    tf.SendEvent(evt);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"[UIToolkitInput] notify change failed: {ex.Message}");
+            }
         }
 
         private static void HandleBackspace(TextField tf)
@@ -399,16 +664,12 @@ namespace ChillPatcher
                 // 删除选区
                 int start = Math.Min(cursor, select);
                 int end = Math.Max(cursor, select);
-                tf.value = curText.Remove(start, end - start);
-                tf.cursorIndex = start;
-                tf.selectIndex = start;
+                SetTextAndCaret(tf, curText.Remove(start, end - start), start);
             }
             else if (cursor > 0)
             {
                 // 删除光标前一个字符
-                tf.value = curText.Remove(cursor - 1, 1);
-                tf.cursorIndex = cursor - 1;
-                tf.selectIndex = cursor - 1;
+                SetTextAndCaret(tf, curText.Remove(cursor - 1, 1), cursor - 1);
             }
         }
 
@@ -443,11 +704,7 @@ namespace ChillPatcher
                     break;
                 case 0x2E: // Delete
                     if (cursor < curText.Length)
-                    {
-                        tf.value = curText.Remove(cursor, 1);
-                        tf.cursorIndex = cursor;
-                        tf.selectIndex = cursor;
-                    }
+                        SetTextAndCaret(tf, curText.Remove(cursor, 1), cursor);
                     break;
             }
         }
@@ -476,9 +733,7 @@ namespace ChillPatcher
 
             int start = Math.Min(cursor, select);
             int end = Math.Max(cursor, select);
-            tf.value = curText.Remove(start, end - start);
-            tf.cursorIndex = start;
-            tf.selectIndex = start;
+            SetTextAndCaret(tf, curText.Remove(start, end - start), start);
         }
 
         private static void DispatchReturnKeyEvent(TextField tf)

@@ -28,6 +28,8 @@ namespace ChillPatcher
             DoInject("immediate");
 
             // Also re-inject after 3 seconds in case the game resets the PlayerLoop
+            // Capture Unity's context on the installation thread.
+            var unityContext = SynchronizationContext.Current;
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 Thread.Sleep(3000);
@@ -36,7 +38,20 @@ namespace ChillPatcher
                 // Since we have no main thread access, just do it directly (Unity 2021+ allows this)
                 try
                 {
-                    DoInject("delayed-3s");
+                    // GetCurrentPlayerLoop/SetPlayerLoop must run on Unity's main thread.
+                    if (unityContext == null)
+                    {
+                        _log?.LogWarning("[PlayerLoop] No main-thread context; skipping delayed injection");
+                        return;
+                    }
+                    unityContext.Post(state =>
+                    {
+                        try { DoInject("delayed-3s"); }
+                        catch (Exception ex)
+                        {
+                            _log?.LogError($"[PlayerLoop] Delayed main-thread injection failed: {ex}");
+                        }
+                    }, null);
                 }
                 catch (Exception ex)
                 {

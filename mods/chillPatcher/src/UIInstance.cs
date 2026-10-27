@@ -63,6 +63,19 @@ namespace ChillPatcher
             }
         }
 
+        /// <summary>
+        /// 只切换面板可见性，不销毁/重建 UI。用 SetActive 重新显示会让
+        /// UI Toolkit 丢失文本与图标资源，所以用 display 样式来隐藏。
+        /// </summary>
+        public void SetPanelVisible(bool visible)
+        {
+            var root = _engine?.UIDocument?.rootVisualElement;
+            if (root == null) return;
+            root.style.display = visible
+                ? UnityEngine.UIElements.DisplayStyle.Flex
+                : UnityEngine.UIElements.DisplayStyle.None;
+        }
+
         public UIInstance(string id, string workingDir, string entryFile, int sortingOrder, bool enabled, bool interactive, ManualLogSource log)
         {
             Id = id;

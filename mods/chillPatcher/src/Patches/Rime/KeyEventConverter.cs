@@ -30,6 +30,54 @@ namespace ChillPatcher.Patches.Rime
         private static extern short GetKeyState(int nVirtKey);
 
         // ibus::Keycode 定义(来自 weasel/include/KeyEvent.h)
+        private static readonly bool[] Held = new bool[256];
+        private static bool seeded, caps;
+        // Re-seed after hook restart; key-up events may have been missed.
+        public static void ResetState()
+        {
+            Array.Clear(Held, 0, Held.Length);
+            seeded = false;
+            caps = false;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr processId);
+        [DllImport("user32.dll")]
+        private static extern uint MapVirtualKeyEx(uint code, uint mapType, IntPtr layout);
+        [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+        public static void ObserveKey(uint vk, int message)
+        {
+            if (vk >= 256) return;
+            bool down = message == 0x100 || message == 0x104;
+            if (!down && message != 0x101 && message != 0x105) return;
+            if (!seeded)
+            {
+                for (int i = 0; i < 256; i++) Held[i] = (GetAsyncKeyState(i) & 0x8000) != 0;
+                caps = (GetKeyState(0x14) & 1) != 0;
+                // LL events identify left/right modifiers; do not retain generic seed bits.
+                Held[0x10] = Held[0x11] = Held[0x12] = false;
+                seeded = true;
+            }
+            // LL callback runs before the current event updates async state.
+            if (vk == 0x14 && down && !Held[vk]) caps = !caps;
+            Held[vk] = down;
+        }
+        /// <summary>
+        /// 最近一次观察到的 Shift 是否按下。低级钩子在本事件生效前触发，
+        /// GetAsyncKeyState 不可靠，因此用观察到的按键状态判断修饰键。
+        /// </summary>
+        public static bool ShiftHeld => Held[0xA0] || Held[0xA1] || Held[0x10];
+        private static void ApplyModifiers(byte[] state)
+        {
+            if (!seeded) return;
+            for (int i = 0xA0; i <= 0xA5; i++) state[i] = Held[i] ? (byte)128 : (byte)0;
+            state[0x10] = (Held[0xA0] || Held[0xA1] || Held[0x10]) ? (byte)128 : (byte)0;
+            state[0x11] = (Held[0xA2] || Held[0xA3] || Held[0x11]) ? (byte)128 : (byte)0;
+            state[0x12] = (Held[0xA4] || Held[0xA5] || Held[0x12]) ? (byte)128 : (byte)0;
+            state[0x14] = caps ? (byte)1 : (byte)0;
+        }
         private const int BackSpace = 0xFF08;
         private const int Tab = 0xFF09;
         private const int Return = 0xFF0D;
@@ -56,12 +104,13 @@ namespace ChillPatcher.Patches.Rime
 
             // 获取键盘状态
             byte[] keyState = new byte[256];
-            if (!GetKeyboardState(keyState))
+            if (!GetKeyboardState(keyState) && !seeded)
             {
                 return false;
             }
 
             // 设置 mask (修饰键状态)
+            ApplyModifiers(keyState);
             const byte KEY_DOWN = 0x80;
             const byte TOGGLED = 0x01;
 
@@ -94,8 +143,12 @@ namespace ChillPatcher.Patches.Rime
             tempKeyState[0x11] = 0; // VK_CONTROL
             tempKeyState[0x12] = 0; // VK_MENU
 
-            IntPtr hkl = GetKeyboardLayout(0);
-            int result = ToUnicodeEx(vkCode, scanCode, tempKeyState, buffer, buffer.Capacity, 0, hkl);
+            // The hook thread's layout can differ from the active desktop layout.
+            uint foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+            IntPtr hkl = GetKeyboardLayout(foregroundThread);
+            if (scanCode == 0) scanCode = MapVirtualKeyEx(vkCode, 0, hkl);
+            // Windows 10+: do not mutate the foreground thread's dead-key state.
+            int result = ToUnicodeEx(vkCode, scanCode, tempKeyState, buffer, buffer.Capacity, 4, hkl);
 
             if (result == 1)
             {

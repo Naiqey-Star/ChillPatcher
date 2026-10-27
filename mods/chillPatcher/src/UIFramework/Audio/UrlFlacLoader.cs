@@ -44,6 +44,7 @@ namespace ChillPatcher.UIFramework.Audio
         private FileStream _writeStream;
         private FlacDecoder.FlacStreamReader _flacReader;
         
+        private readonly object _readerGate = new object();
         private volatile bool _disposed;
         private volatile bool _downloadComplete;
         private volatile bool _downloadFailed;
@@ -147,8 +148,11 @@ namespace ChillPatcher.UIFramework.Audio
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
+            lock (_readerGate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+            }
 
             try
             {
@@ -240,7 +244,21 @@ namespace ChillPatcher.UIFramework.Audio
                 Plugin.Log.LogInfo($"[UrlFlacLoader] Buffer ready ({downloadedBytes} bytes), opening FLAC decoder...");
 
                 // 打开 FLAC 解码器
-                _flacReader = new FlacDecoder.FlacStreamReader(_cacheFilePath);
+                var openedReader = await Task.Run(() => new FlacDecoder.FlacStreamReader(_cacheFilePath, cancellationToken), cancellationToken);
+                try
+                {
+                    lock (_readerGate)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (_disposed) throw new ObjectDisposedException(nameof(UrlFlacLoader));
+                        _flacReader = openedReader;
+                        openedReader = null;
+                    }
+                }
+                finally
+                {
+                    openedReader?.Dispose();
+                }
 
                 Plugin.Log.LogInfo($"[UrlFlacLoader] ✅ Ready: {_flacReader.SampleRate}Hz, {_flacReader.Channels}ch, {_flacReader.TotalPcmFrames} frames");
 

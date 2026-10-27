@@ -254,7 +254,29 @@ namespace ChillPatcher.Native
             public ulong TotalPcmFrames { get; private set; }
             public ulong CurrentFrame { get; private set; }
 
-            public FlacStreamReader(string filePath)
+            private static readonly object ProbeGate = new object();
+            private static readonly System.Collections.Generic.Dictionary<string, ulong> ProbeCache
+                = new System.Collections.Generic.Dictionary<string, ulong>();
+
+            // STREAMINFO total samples is a 36-bit per-channel frame count, not an estimate.
+            private static ulong ReadStreamInfoFrames(string path, int rate, int channels)
+            {
+                using (var reader = new BinaryReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
+                {
+                    var bytes = reader.ReadBytes(42);
+                    if (bytes.Length != 42 || bytes[0] != 102 || bytes[1] != 76 ||
+                        bytes[2] != 97 || bytes[3] != 67 || (bytes[4] & 127) != 0 ||
+                        bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 34)
+                        return 0;
+                    int metadataRate = (bytes[18] << 12) | (bytes[19] << 4) | (bytes[20] >> 4);
+                    int metadataChannels = ((bytes[20] >> 1) & 7) + 1;
+                    if (metadataRate != rate || metadataChannels != channels) return 0;
+                    return ((ulong)(bytes[21] & 15) << 32) | ((ulong)bytes[22] << 24) |
+                        ((ulong)bytes[23] << 16) | ((ulong)bytes[24] << 8) | bytes[25];
+                }
+            }
+
+            public FlacStreamReader(string filePath, System.Threading.CancellationToken cancellationToken = default)
             {
                 _streamHandle = OpenFlacStream(
                     filePath,
@@ -267,6 +289,62 @@ namespace ChillPatcher.Native
                     throw new Exception($"Failed to open FLAC stream: {GetErrorMessage()}");
                 }
 
+                try
+                {
+                    if (sampleRate <= 0 || channels < 1 || channels > 8)
+                        throw new IOException("Invalid audio stream format.");
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (totalFrames == 0)
+                        totalFrames = ReadStreamInfoFrames(filePath, sampleRate, channels);
+                    if (totalFrames == 0)
+                    {
+                        // All callers must construct on a worker; serialize expensive fallback scans.
+                        lock (ProbeGate)
+                        {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var info = new FileInfo(filePath);
+                        string cacheKey = info.FullName + "|" + info.Length + "|" + info.LastWriteTimeUtc.Ticks;
+                        if (!ProbeCache.TryGetValue(cacheKey, out totalFrames))
+                        {
+                        var probe = new float[4096 * channels];
+                        long count;
+                        while ((count = ReadFlacFrames(_streamHandle, probe, 4096)) > 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            totalFrames = checked(totalFrames + (ulong)count);
+                            if (totalFrames > int.MaxValue)
+                                throw new IOException("Audio exceeds Unity clip length limit.");
+                        }
+                        if (count < 0 || totalFrames == 0)
+                            throw new IOException("Unable to determine audio length: " + GetErrorMessage());
+                            cancellationToken.ThrowIfCancellationRequested();
+                            info.Refresh();
+                            if (cacheKey == info.FullName + "|" + info.Length + "|" + info.LastWriteTimeUtc.Ticks)
+                            {
+                                if (ProbeCache.Count >= 128) ProbeCache.Clear();
+                                ProbeCache[cacheKey] = totalFrames;
+                            }
+                        CloseFlacStream(_streamHandle);
+                        _streamHandle = IntPtr.Zero;
+                        _streamHandle = OpenFlacStream(filePath, out sampleRate, out channels, out ulong ignored);
+                        if (_streamHandle == IntPtr.Zero)
+                            throw new IOException("Failed to reopen audio stream: " + GetErrorMessage());
+                        }
+                    }
+                }
+                }
+                catch
+                {
+                    if (_streamHandle != IntPtr.Zero) CloseFlacStream(_streamHandle);
+                    _streamHandle = IntPtr.Zero;
+                    throw;
+                }
+                if (totalFrames > int.MaxValue)
+                {
+                    CloseFlacStream(_streamHandle);
+                    _streamHandle = IntPtr.Zero;
+                    throw new IOException("Audio exceeds Unity clip length limit.");
+                }
                 SampleRate = sampleRate;
                 Channels = channels;
                 TotalPcmFrames = totalFrames;
@@ -281,7 +359,15 @@ namespace ChillPatcher.Native
             /// <param name="buffer">交错格式的 float 缓冲区（长度 = 帧数 * 声道数）</param>
             /// <param name="framesToRead">要读取的帧数</param>
             /// <returns>实际读取的帧数</returns>
+            // Serialize native handle use and release for local and URL readers.
+            private readonly object _handleGate = new object();
+
             public long ReadFrames(float[] buffer, ulong framesToRead)
+            {
+                lock (_handleGate) return ReadFramesCore(buffer, framesToRead);
+            }
+
+            private long ReadFramesCore(float[] buffer, ulong framesToRead)
             {
                 if (_disposed || _streamHandle == IntPtr.Zero)
                     throw new ObjectDisposedException(nameof(FlacStreamReader));
@@ -300,6 +386,11 @@ namespace ChillPatcher.Native
             /// </summary>
             public bool Seek(ulong frameIndex)
             {
+                lock (_handleGate) return SeekCore(frameIndex);
+            }
+
+            private bool SeekCore(ulong frameIndex)
+            {
                 if (_disposed || _streamHandle == IntPtr.Zero)
                     throw new ObjectDisposedException(nameof(FlacStreamReader));
 
@@ -314,6 +405,11 @@ namespace ChillPatcher.Native
             }
 
             public void Dispose()
+            {
+                lock (_handleGate) DisposeCore();
+            }
+
+            private void DisposeCore()
             {
                 if (!_disposed)
                 {

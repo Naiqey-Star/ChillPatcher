@@ -94,6 +94,20 @@ namespace ChillPatcher
             }
         }
 
+        /// <summary>Human readable name for a module id, used for fallback tags.</summary>
+        public static string ModuleDisplayName(string moduleId)
+        {
+            switch (moduleId)
+            {
+                case "com.chillpatcher.netease": return "网易云音乐";
+                case "com.chillpatcher.qqmusic": return "QQ音乐";
+                case "com.chillpatcher.spotify": return "Spotify";
+                case "com.chillpatcher.bilibili": return "Bilibili";
+                case "com.chillpatcher.localfolder": return "本地文件夹";
+                default: return moduleId;
+            }
+        }
+
         // Song and Album cache
         private Dictionary<string, MusicInfo> _songsCache = new Dictionary<string, MusicInfo>();
         private Dictionary<string, AlbumInfo> _albumsCache = new Dictionary<string, AlbumInfo>();
@@ -662,9 +676,15 @@ namespace ChillPatcher
                 }
 
                 // ── Phase 1: All native queries (thread-pool safe, P/Invoke) ──
+                Plugin.Log?.LogInfo("[OmniMix] Import: querying playlist sources");
                 var sourcesJson = await _client.GetPlaylistSources();
+                Plugin.Log?.LogInfo("[OmniMix] Import: playlist sources returned");
+                Plugin.Log?.LogInfo("[OmniMix] Import: querying albums");
                 var albumsJson = await _client.GetAlbums();
+                Plugin.Log?.LogInfo("[OmniMix] Import: albums returned");
+                Plugin.Log?.LogInfo("[OmniMix] Import: querying queue");
                 var queueJson = await _client.GetQueue();
+                Plugin.Log?.LogInfo("[OmniMix] Import: queue returned");
 
                 // Build source → tag bit mapping (lock-protected, thread-safe)
                 var sourceTagBits = new List<(string refId, ulong bit, string name)>();
@@ -684,7 +704,9 @@ namespace ChillPatcher
                 }
 
                 // Query all tracks once for metadata, then per-playlist for tag membership
+                Plugin.Log?.LogInfo("[OmniMix] Import: querying all tracks");
                 var allTracksJson = await _client.GetSongs();
+                Plugin.Log?.LogInfo("[OmniMix] Import: all tracks returned");
                 var perSourceResults = new List<(ulong bit, JToken tracks)>();
                 foreach (var (refId, bit, _) in sourceTagBits)
                 {
@@ -773,6 +795,34 @@ namespace ChillPatcher
                         }
                     }
                     Plugin.Log?.LogInfo($"[OmniMix] Source bit={bit} matched {matched} tracks");
+                }
+
+                // Some modules (e.g. NetEase) expose tracks in the library but report no
+                // playlist source for this instance. Fall back to one tag per module so the
+                // music is still reachable in game instead of silently syncing nothing.
+                if (sourceTagBits.Count == 0 && songDict.Count > 0)
+                {
+                    var moduleBits = new Dictionary<string, ulong>();
+                    foreach (var kvp in songDict)
+                    {
+                        var mid = string.IsNullOrEmpty(kvp.Value.ModuleId) ? "unknown" : kvp.Value.ModuleId;
+                        if (!moduleBits.TryGetValue(mid, out var moduleBit))
+                        {
+                            moduleBit = GetPlaylistBit(mid);
+                            if (moduleBit == 0) continue;
+                            moduleBits[mid] = moduleBit;
+                            _allPlaylists.Add(new TagInfo
+                            {
+                                TagId = mid,
+                                DisplayName = ModuleDisplayName(mid),
+                                ModuleId = mid,
+                                BitValue = moduleBit,
+                                IsGrowableList = false,
+                            });
+                        }
+                        uuidTagBits[kvp.Key] |= moduleBit;
+                    }
+                    Plugin.Log?.LogInfo($"[OmniMix] No playlist sources; built {_allPlaylists.Count} module tags");
                 }
 
                 // Build lookup: uuid → tag value (no GameAudioInfo allocation yet)

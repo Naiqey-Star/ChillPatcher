@@ -114,6 +114,8 @@ namespace ChillPatcher.Patches
         [HarmonyPatch(typeof(FacilityMusic), "Setup")]
         public static void FacilityMusic_Setup_Postfix()
         {
+            RightIconsCompactLayout.Ensure();
+            RightBottomRowLayout.Ensure();
             if (!UIFrameworkConfig.EnableUIRearrange.Value)
             {
                 Logger.LogInfo("UI 重排列已禁用");
@@ -199,7 +201,7 @@ namespace ChillPatcher.Patches
                 if (rightIcons != null)
                 {
                     // 应用缩放
-                    rightIcons.transform.localScale = new Vector3(RightIconsContainerScale, RightIconsContainerScale, 1f);
+                    RightIconsCompactLayout.Ensure();
                     Logger.LogInfo($"已设置 RightIcons 整体缩放为 {RightIconsContainerScale}");
                     
                     // 应用垂直偏移（正值向下）
@@ -207,7 +209,7 @@ namespace ChillPatcher.Patches
                     if (rightIconsRect != null)
                     {
                         var pos = rightIconsRect.anchoredPosition;
-                        pos.y -= RightIconsVerticalOffset;  // 减去是因为 UI 坐标系 Y 向上为正
+                        // 垂直位置由 RightIconsCompactLayout 绝对计算，不再累积偏移。
                         rightIconsRect.anchoredPosition = pos;
                         Logger.LogInfo($"已设置 RightIcons 垂直偏移为 {RightIconsVerticalOffset}");
                     }

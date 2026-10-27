@@ -70,11 +70,8 @@ namespace ChillPatcher.Integration
                     ["type"] = type.ToString(),
                     ["state"] = getPomodoroStateObject()
                 })).AddTo(_subscriptions);
-                pomodoro.OnUpdateWorkHour.Subscribe(_ => Emit("pomodoroWorkHourUpdated", getPlayerProgressObject())).AddTo(_subscriptions);
-                pomodoro.OnPreAddExpAndPointFromCompletePomodoro.Subscribe(exp => Emit("pomodoroPreReward", new Dictionary<string, object>
-                {
-                    ["exp"] = exp
-                })).AddTo(_subscriptions);
+                // Compatibility: this game build has no OnUpdateWorkHour event.
+                // Compatibility: pre-reward event unavailable in this game build.
 
                 var levelService = ResolvePlayerLevelService();
                 if (levelService != null)
@@ -221,7 +218,7 @@ namespace ChillPatcher.Integration
                 ["totalWorkSeconds"] = save.PlayerData?.PomodoroTotalWorkSeconds ?? 0d,
                 ["lastWorkStartTimeSeconds"] = svc?.LastWorkStartTimeSeconds ?? float.MinValue,
                 ["lastWorkEndTimeSeconds"] = svc?.LastWorkEndTimeSeconds ?? float.MinValue,
-                ["lastPomodoroTotalWorkHours"] = svc?.LastPomodoroTotalWorkHours ?? 0f,
+                ["lastPomodoroTotalWorkHours"] = (object)null /* unavailable in this game build; do not fabricate zero */,
                 ["isLastFinishedMidway"] = svc?.IsLastPomodoroFinishedMidway ?? false
             };
         }
