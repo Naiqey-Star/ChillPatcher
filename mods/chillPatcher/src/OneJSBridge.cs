@@ -31,6 +31,10 @@ namespace ChillPatcher
         // 向后兼容：指向 "default" 实例
         public static ScriptEngine Engine => GetInstance("default")?.Engine;
         public static bool IsInitialized => _initDone;
+
+        /// <summary>面板被 F9 隐藏时置为 true，暂停所有 UI 实例的逐帧更新。</summary>
+        internal static bool TickPaused;
+        private static float _lastInstanceTick;
         public static ChillJSApi JSApi => GetInstance("default")?.JSApi;
 
         /// <summary>所有实例</summary>
@@ -112,13 +116,20 @@ namespace ChillPatcher
                 return;
             }
 
+            // 面板隐藏时暂停 JS 更新（计时器/歌词滚动会停住，恢复后续跑）
+            if (TickPaused) return;
+
             // UIToolkit 键盘输入分发（早于 TMP LateUpdate 消费队列）
             UIToolkitInputDispatcher.Tick();
 
-            // Tick 所有启用的实例
-            foreach (var kv in _instances)
+            // UI 实例限频到 20Hz：小组件不需要每帧更新，能显著降低整机卡顿
+            if (UnityEngine.Time.unscaledTime - _lastInstanceTick >= 0.05f)
             {
-                kv.Value.Tick();
+                _lastInstanceTick = UnityEngine.Time.unscaledTime;
+                foreach (var kv in _instances)
+                {
+                    kv.Value.Tick();
+                }
             }
 
             if (_tickCount == 5 && !_diagDone)

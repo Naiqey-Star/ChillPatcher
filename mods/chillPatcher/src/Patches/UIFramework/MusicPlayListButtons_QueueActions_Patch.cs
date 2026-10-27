@@ -91,6 +91,8 @@ namespace ChillPatcher.Patches.UIFramework
                     {
                         // 尝试补充缺失的按钮
                         EnsureQueueButtons(container, audioInfo);
+                        UpdateContainerButtons(container, audioInfo);
+                        UpdatePlayingState(instance, contents);
                     }
                 }
                 catch (System.Exception ex)
@@ -198,7 +200,8 @@ namespace ChillPatcher.Patches.UIFramework
                 }
                 else
                 {
-                    // 更新容器内按钮关联的audioInfo
+                    // 虚拟列表复用时也补齐延迟缓存的按钮，再重新绑定当前歌曲。
+                    EnsureQueueButtons(container, audioInfo);
                     UpdateContainerButtons(container, audioInfo);
                 }
                 
@@ -436,7 +439,8 @@ namespace ChillPatcher.Patches.UIFramework
             layoutGroup.spacing = spacing;
             
             // 创建 AddToQueue 按钮
-            var addToQueueBtn = CreateAddToQueueButton(containerObj.transform, audioInfo);
+            var addToQueueBtn = PrefabFactory.XCloseButtonPrefab != null
+                ? CreateAddToQueueButton(containerObj.transform, audioInfo) : null;
             QueueButtonData addToQueueData = null;
             if (addToQueueBtn != null)
             {
@@ -450,7 +454,8 @@ namespace ChillPatcher.Patches.UIFramework
             }
             
             // 创建 PlayNext 按钮，传入 AddToQueue 按钮的数据引用
-            var playNextBtn = CreatePlayNextButton(containerObj.transform, audioInfo, addToQueueData);
+            var playNextBtn = PrefabFactory.CircleArrowButtonPrefab != null
+                ? CreatePlayNextButton(containerObj.transform, audioInfo, addToQueueData) : null;
             if (playNextBtn != null)
             {
                 // 添加 LayoutElement 控制大小

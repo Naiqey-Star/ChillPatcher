@@ -20,7 +20,8 @@ namespace ChillPatcher
             { "UI", 2 },        // v2: TagDropdownHeightOffset 默认值从50改为80
             { "Maintenance", 1 },
             { "Audio", 1 },     // 音频自动静音功能
-            { "Build", 1 }      // npm/esbuild 构建开关
+            { "Build", 1 },     // npm/esbuild 构建开关
+            { "AutoDiary", 1 }  // AIChat 自动日记
         };
         
         // 需要重置的分区集合
@@ -74,6 +75,18 @@ namespace ChillPatcher
 
         // npm/esbuild 构建开关
         public static ConfigEntry<bool> EnableNpmAndEsbuild { get; private set; }
+
+        // 自动日记设置
+        public static ConfigEntry<bool> AutoDiaryEnabled { get; private set; }
+        public static ConfigEntry<float> AutoDiaryDebounceSeconds { get; private set; }
+        public static ConfigEntry<int> AutoDiaryMaxChars { get; private set; }
+        public static ConfigEntry<string> AutoDiaryLanguage { get; private set; }
+        public static ConfigEntry<string> AutoDiaryModelOverride { get; private set; }
+        public static ConfigEntry<string> AutoDiaryPromptOverride { get; private set; }
+        public static ConfigEntry<bool> AutoDiaryIncremental { get; private set; }
+        public static ConfigEntry<bool> CalendarMemoryEnabled { get; private set; }
+        public static ConfigEntry<int> CalendarMemoryDays { get; private set; }
+        public static ConfigEntry<int> CalendarMemoryMaxChars { get; private set; }
         
         // 配置文件引用（用于版本重置）
         private static ConfigFile _configFile;
@@ -396,6 +409,99 @@ namespace ChillPatcher
                 "true = 启用npm自动安装依赖和esbuild实时监听构建\n" +
                 "false = 直接使用工作目录中已编译的JS文件（默认）\n" +
                 "注意：关闭时请确保@outputs目录中已有编译好的JS文件"
+            );
+
+            // 自动日记（AIChat 每轮对话后自动更新当天原生日记）
+            AutoDiaryEnabled = config.Bind(
+                "AutoDiary",
+                "AutoDiaryEnabled",
+                true,
+                "是否启用自动日记\n" +
+                "true = 每轮 AIChat 对话成功结束后，自动把当天聊天内容整理进游戏原生日记\n" +
+                "false = 关闭（仍可用 chill.diary.setToday 手动写入）"
+            );
+
+            AutoDiaryDebounceSeconds = config.Bind(
+                "AutoDiary",
+                "AutoDiaryDebounceSeconds",
+                2.5f,
+                new ConfigDescription(
+                    "最后一轮对话结束后等待多久再生成日记（秒）\n" +
+                    "连续多轮聊天会合并成一次生成，避免频繁请求 API",
+                    new AcceptableValueRange<float>(0.2f, 60f)
+                )
+            );
+
+            AutoDiaryMaxChars = config.Bind(
+                "AutoDiary",
+                "AutoDiaryMaxChars",
+                500,
+                new ConfigDescription(
+                    "单篇日记的最大字数（超出时按句子截断）",
+                    new AcceptableValueRange<int>(100, 3000)
+                )
+            );
+
+            AutoDiaryLanguage = config.Bind(
+                "AutoDiary",
+                "AutoDiaryLanguage",
+                "zh",
+                "日记语言：zh（简体中文）/ ja（日语）/ en（英语）"
+            );
+
+            AutoDiaryModelOverride = config.Bind(
+                "AutoDiary",
+                "AutoDiaryModelOverride",
+                "",
+                "日记生成使用的模型名称\n" +
+                "留空 = 使用 AIChat 插件配置里的 ModelName"
+            );
+
+            AutoDiaryPromptOverride = config.Bind(
+                "AutoDiary",
+                "AutoDiaryPromptOverride",
+                "",
+                "自定义日记生成的 System Prompt\n" +
+                "留空 = 使用内置提示词（按 AutoDiaryLanguage 选择）"
+            );
+
+            AutoDiaryIncremental = config.Bind(
+                "AutoDiary",
+                "AutoDiaryIncremental",
+                true,
+                "是否用续写方式更新当天日记\n" +
+                "true = 以已有日记为底稿，把新对话续写进去（保留此前写下的内容）\n" +
+                "false = 每次只用本轮新增对话重新生成（旧内容会被覆盖）"
+            );
+
+            // 日历记忆（让 AIChat 读到玩家写下的日记，作为对角色/共同经历的印象）
+            CalendarMemoryEnabled = config.Bind(
+                "CalendarMemory",
+                "CalendarMemoryEnabled",
+                true,
+                "是否把日历日记作为长期记忆注入 AIChat 的 System Prompt\n" +
+                "true = 每次对话请求前，把最近几天的日记（你自己写的）附加到人设后面\n" +
+                "false = 关闭（不影响日记功能）"
+            );
+
+            CalendarMemoryDays = config.Bind(
+                "CalendarMemory",
+                "CalendarMemoryDays",
+                7,
+                new ConfigDescription(
+                    "注入多少天的日记（按最近有内容的天数计算）",
+                    new AcceptableValueRange<int>(1, 60)
+                )
+            );
+
+            CalendarMemoryMaxChars = config.Bind(
+                "CalendarMemory",
+                "CalendarMemoryMaxChars",
+                1200,
+                new ConfigDescription(
+                    "注入记忆的最大字数（超出时优先保留最近几天）",
+                    new AcceptableValueRange<int>(200, 8000)
+                )
             );
 
             // 系统媒体控制配置

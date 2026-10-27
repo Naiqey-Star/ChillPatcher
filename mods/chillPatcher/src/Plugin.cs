@@ -24,16 +24,35 @@ namespace ChillPatcher
         internal static ManualLogSource Log;
 
         /// <summary>
-        /// 插件根目录
-        /// </summary>
+        /// 鎻掍欢鏍圭洰褰?        /// </summary>
         public static string PluginPath { get; private set; }
 
         private void Awake()
         {
-            BuildSetupOverlay.Show();
-
+            // 启动不再显示黑色控制台窗口；只有真正需要构建/切换 profile 时才显示。
             Logger = base.Logger;
             Log = Logger;
+            // Record runtime provenance before patching or SDK-dependent initialization.
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies()
+                .Where(a => a.GetName().Name.StartsWith("ChillPatcher", StringComparison.OrdinalIgnoreCase)))
+            {
+                try
+                {
+                    var location = assembly.Location;
+                    var hash = "unavailable";
+                    if (File.Exists(location))
+                    {
+                        using (var sha = System.Security.Cryptography.SHA256.Create())
+                        using (var stream = File.OpenRead(location))
+                            hash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");
+                    }
+                    Logger.LogInfo($"[RuntimeProvenance] Assembly={assembly.FullName}; Path={location}; MVID={assembly.ManifestModule.ModuleVersionId}; SHA256={hash}");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning($"[RuntimeProvenance] {assembly.FullName}: {ex.Message}");
+                }
+            }
 
             PluginPath = Path.GetDirectoryName(Info.Location);
 
@@ -81,6 +100,33 @@ namespace ChillPatcher
             Logger.LogInfo("====================================");
 
             KeyboardHookPatch.Initialize();
+
+            // 自动日记：AIChat 每轮对话后更新当天原生日记
+            try
+            {
+                Integration.AutoDiaryService.Initialize(Logger);
+                // 日历记忆：把日记注入 AIChat 的 System Prompt
+                Integration.CalendarMemoryService.Initialize(Logger);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"Failed to initialize AutoDiaryService: {ex.Message}");
+            }
+
+            // Automatic compact layout replaces the interactive layout editor.
+            try
+            {
+                ChillPatcher.Patches.RightIconsCompactLayout.Ensure();
+                ChillPatcher.Patches.RightBottomRowLayout.Ensure();
+                ChillPatcher.Patches.WallpaperMouseBridge.Ensure();
+                ChillPatcher.Patches.RimeCandidateOverlay.Ensure();
+                // Interactive F8 layout editor removed; automatic compact layout only.
+                Logger.LogInfo("RightIcons compact layout initialized");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Failed to initialize compact layout: {ex}");
+            }
 
             if (PluginConfig.EnableAchievementCache.Value)
             {

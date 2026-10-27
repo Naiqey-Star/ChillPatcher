@@ -185,6 +185,7 @@ namespace ChillPatcher.Rime
             traits.MinLogLevel = 2;           // 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
             traits.PrebuiltDataDir = sharedDataDir;  // OpenCC 从 shared 目录下查找
 
+            RimeNativeLoader.EnsureLoaded();
             RimeApi.RimeSetup(ref traits);
             
             // 初始化部署器,加载部署模块

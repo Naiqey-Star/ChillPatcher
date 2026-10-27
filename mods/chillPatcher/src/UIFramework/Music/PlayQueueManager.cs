@@ -145,10 +145,17 @@ namespace ChillPatcher.UIFramework.Music
         /// 添加歌曲到播放历史
         /// 如果在历史回溯模式中，会丢弃当前位置之前的历史（类似浏览器历史行为）
         /// </summary>
+        /// <summary>单曲循环“切下一首再切回”时，跳过这几条历史记录。</summary>
+        public static int SuppressHistoryAdds;
+
         public void AddToHistory(GameAudioInfo audio)
         {
             if (audio == null) return;
-            
+            if (SuppressHistoryAdds > 0)
+            {
+                SuppressHistoryAdds--;
+                return;
+            }
             // 如果在历史回溯模式中，丢弃当前位置之前的历史
             // 例如：历史是 [5,4,3,2,1]，_historyPosition=2（正在播放3）
             // 添加新歌曲6后，应该变成 [6,3,2,1]（丢弃5和4）

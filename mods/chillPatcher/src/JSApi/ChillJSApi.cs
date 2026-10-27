@@ -91,6 +91,11 @@ namespace ChillPatcher.JSApi
         public ChillAIChatApi aichat { get; }
 
         /// <summary>
+        /// 自动日记 API（读写当日原生日记）
+        /// </summary>
+        public ChillDiaryApi diary { get; }
+
+        /// <summary>
         /// 游戏控制 API（番茄钟/经验等级）
         /// </summary>
         public ChillGameApi game { get; }
@@ -174,6 +179,7 @@ namespace ChillPatcher.JSApi
             io = new ChillIOApi(logger);
             instances = new ChillInstanceApi(logger);
             aichat = new ChillAIChatApi(logger);
+            diary = new ChillDiaryApi(logger);
             game = new ChillGameApi(logger);
             steam = new ChillSteamApi(logger);
             saveProfile = new ChillSaveProfileApi(logger);

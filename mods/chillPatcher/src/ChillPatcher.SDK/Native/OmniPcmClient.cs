@@ -537,11 +537,11 @@ namespace ChillPatcher.SDK.Native
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int OmniPcmClient_QueryTracks(IntPtr client,
-            ref OmniPcmTrackQuery query, [Out] OmniPcmTrackInfo[] outTracks, ref int inoutCount);
+            ref OmniPcmTrackQuery query, IntPtr outTracks, ref int inoutCount);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int OmniPcmClient_QueryAlbums(IntPtr client,
-            ref OmniPcmLibraryQuery query, [Out] OmniPcmAlbumInfo[] outAlbums, ref int inoutCount);
+            ref OmniPcmLibraryQuery query, IntPtr outAlbums, ref int inoutCount);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int OmniPcmClient_QueryTags(IntPtr client,
@@ -550,21 +550,48 @@ namespace ChillPatcher.SDK.Native
         public OmniPcmTrackInfo[] QueryTracks(OmniPcmTrackQuery query)
         {
             int count = 0;
-            var r = OmniPcmClient_QueryTracks(_handle, ref query, null, ref count);
-            if (r != (int)OmniPcmResult.NotReady || count == 0) return Array.Empty<OmniPcmTrackInfo>();
-            var tracks = new OmniPcmTrackInfo[count];
-            r = OmniPcmClient_QueryTracks(_handle, ref query, tracks, ref count);
-            return r == 0 ? tracks : Array.Empty<OmniPcmTrackInfo>();
+            var r = OmniPcmClient_QueryTracks(_handle, ref query, IntPtr.Zero, ref count);
+            if (r != (int)OmniPcmResult.NotReady || count <= 0) return Array.Empty<OmniPcmTrackInfo>();
+            int capacity = count;
+            int stride = Marshal.SizeOf(typeof(OmniPcmTrackInfo));
+            IntPtr buffer = Marshal.AllocHGlobal(checked(capacity * stride));
+            try
+            {
+                r = OmniPcmClient_QueryTracks(_handle, ref query, buffer, ref count);
+                if (r != 0) return Array.Empty<OmniPcmTrackInfo>();
+                if (count < 0 || count > capacity)
+                    throw new InvalidOperationException("QueryTracks returned an invalid count");
+                var tracks = new OmniPcmTrackInfo[count];
+                for (int i = 0; i < count; i++)
+                    tracks[i] = (OmniPcmTrackInfo)Marshal.PtrToStructure(
+                        IntPtr.Add(buffer, checked(i * stride)), typeof(OmniPcmTrackInfo));
+                return tracks;
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
         }
 
         public OmniPcmAlbumInfo[] QueryAlbums(OmniPcmLibraryQuery query)
         {
             int count = 0;
-            var r = OmniPcmClient_QueryAlbums(_handle, ref query, null, ref count);
-            if (r != (int)OmniPcmResult.NotReady || count == 0) return Array.Empty<OmniPcmAlbumInfo>();
-            var albums = new OmniPcmAlbumInfo[count];
-            r = OmniPcmClient_QueryAlbums(_handle, ref query, albums, ref count);
-            return r == 0 ? albums : Array.Empty<OmniPcmAlbumInfo>();
+            var r = OmniPcmClient_QueryAlbums(_handle, ref query, IntPtr.Zero, ref count);
+            if (r != (int)OmniPcmResult.NotReady || count <= 0) return Array.Empty<OmniPcmAlbumInfo>();
+            // Avoid runtime-specific marshalling of arrays containing inline strings.
+            int capacity = count;
+            int stride = Marshal.SizeOf(typeof(OmniPcmAlbumInfo));
+            IntPtr buffer = Marshal.AllocHGlobal(checked(capacity * stride));
+            try
+            {
+                r = OmniPcmClient_QueryAlbums(_handle, ref query, buffer, ref count);
+                if (r != 0) return Array.Empty<OmniPcmAlbumInfo>();
+                if (count < 0 || count > capacity)
+                    throw new InvalidOperationException("QueryAlbums returned an invalid count");
+                var albums = new OmniPcmAlbumInfo[count];
+                for (int i = 0; i < count; i++)
+                    albums[i] = (OmniPcmAlbumInfo)Marshal.PtrToStructure(
+                        IntPtr.Add(buffer, checked(i * stride)), typeof(OmniPcmAlbumInfo));
+                return albums;
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
         }
 
         public OmniPcmTagInfo[] QueryTags(OmniPcmLibraryQuery query)

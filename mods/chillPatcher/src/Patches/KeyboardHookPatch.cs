@@ -18,6 +18,12 @@ namespace ChillPatcher.Patches
     public class KeyboardHookPatch
     {
         private static IntPtr hookId = IntPtr.Zero;
+        private static IntPtr mouseHookId = IntPtr.Zero;
+        private static LowLevelMouseProc mouseProc;
+        private static int wheelDeltaPending;
+
+        /// <summary>壁纸模式下累积的滚轮增量（120 = 一格），由主线程消费。</summary>
+        internal static int ConsumeWheelDelta() => Interlocked.Exchange(ref wheelDeltaPending, 0);
         private static LowLevelKeyboardProc hookCallback;
         private static readonly Queue<char> inputQueue = new Queue<char>();
         internal static readonly Queue<string> commitQueue = new Queue<string>();
@@ -33,8 +39,19 @@ namespace ChillPatcher.Patches
         /// <summary>自行跟踪 Ctrl 键状态（低级钩子中 GetAsyncKeyState 不可靠）</summary>
         private static volatile bool _ctrlHeld;
 
+        // Hook thread owns key state; Unity Update consumes only the atomic request.
+        private static bool _layoutF8Held;
+        private static bool _layoutF8Captured;
+        private static int _layoutTogglePending;
+
+        internal static bool ConsumeLayoutToggleRequest()
+        {
+            bool requested = Interlocked.Exchange(ref _layoutTogglePending, 0) != 0;
+            return requested && isGameMode && IsDesktopActive();
+        }
+
         private static Thread hookThread;
-        private static bool isRunning = false;
+        private static volatile bool isRunning = false;
         
         // Rime输入法引擎
         private static RimeEngine rimeEngine = null;
@@ -43,6 +60,115 @@ namespace ChillPatcher.Patches
 
         // 键盘输入模式：true = 游戏模式（拦截输入到游戏），false = 桌面模式（输入到系统）
         private static bool isGameMode = true;
+
+        // Diagnostic: force the desktop-input path so IME can be exercised in a
+        // normal (focused) window. Enable with CHILL_FORCE_RIME=1.
+        private static readonly bool ForceRimeForTest =
+            System.Environment.GetEnvironmentVariable("CHILL_FORCE_RIME") == "1";
+
+        /// <summary>F9 pressed while the desktop is in front; consumed on the main thread.</summary>
+        internal static volatile bool UiTogglePending;
+
+        /// <summary>回车请求：带输入会话代号，切换前台后旧请求自动失效。</summary>
+        private struct ReturnRequest
+        {
+            public int Epoch;
+            public bool Shift;
+        }
+
+        private static readonly Queue<ReturnRequest> returnQueue = new Queue<ReturnRequest>();
+        private static int _returnEpoch;
+        /// <summary>本次物理回车是否已处理按下，用于抑制长按自动重复。</summary>
+        private static bool _enterHeld;
+        /// <summary>当前前台是否仍是我们的输入目标（主线程维护）。</summary>
+        private static volatile bool _captureActive = true;
+        /// <summary>请求钩子线程清空 Rime 组合（组合状态由钩子线程独占）。</summary>
+        internal static volatile bool RimeResetPending;
+
+        // ── 钩子健康状态（诊断与自愈） ──────────────────────────────
+        /// <summary>钩子回调最近一次被系统调用的 UTC ticks（每次按键都会刷新）。</summary>
+        private static long _lastHookEventTicks;
+        /// <summary>主线程请求钩子线程重装钩子（在同一线程内卸旧装新，避免双钩子互相顶掉）。</summary>
+        private static int _reinstallRequested;
+        private static long _lastRimeUninitWarnTicks;
+        private static long _lastCallbackErrorTicks;
+        private static int _hookEventCount;
+        private static int _hookDeadStrikes;
+        private static long _nextProbeTicks;
+
+        /// <summary>最近一次钩子收到按键的耗时（秒），供诊断。</summary>
+        internal static double SecondsSinceHookEvent
+        {
+            get
+            {
+                long last = Interlocked.Read(ref _lastHookEventTicks);
+                if (last == 0) return double.MaxValue;
+                return (DateTime.UtcNow.Ticks - last) / (double)TimeSpan.TicksPerSecond;
+            }
+        }
+
+        internal static int HookEventCount => _hookEventCount;
+
+        private const int MaxPendingInput = 512;
+        private const int MaxPendingCommits = 32;
+        private const int MaxPendingNavigation = 64;
+        private const int MaxPendingClip = 16;
+        private const int MaxPendingReturns = 4;
+
+        /// <summary>钩子线程：登记一次回车（一次物理按压只登记一次）。</summary>
+        private static void EnqueueReturn(bool shift)
+        {
+            lock (queueLock)
+            {
+                while (returnQueue.Count >= MaxPendingReturns) returnQueue.Dequeue();
+                returnQueue.Enqueue(new ReturnRequest { Epoch = _returnEpoch, Shift = shift });
+            }
+        }
+
+        /// <summary>主线程：取出本会话的一条回车请求；过期请求直接丢弃。</summary>
+        internal static bool TryDequeueReturn(out bool shift)
+        {
+            shift = false;
+            lock (queueLock)
+            {
+                int epoch = _returnEpoch;
+                while (returnQueue.Count > 0)
+                {
+                    var req = returnQueue.Dequeue();
+                    if (req.Epoch != epoch) continue;
+                    shift = req.Shift;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static void EnqueueInputChar(char c)
+        {
+            lock (queueLock)
+            {
+                while (inputQueue.Count >= MaxPendingInput) inputQueue.Dequeue();
+                inputQueue.Enqueue(c);
+            }
+        }
+
+        private static void EnqueueCommit(string text)
+        {
+            lock (queueLock)
+            {
+                while (commitQueue.Count >= MaxPendingCommits) commitQueue.Dequeue();
+                commitQueue.Enqueue(text);
+            }
+        }
+
+        private static void EnqueueNavigation(uint vk)
+        {
+            lock (queueLock)
+            {
+                while (navigationKeyQueue.Count >= MaxPendingNavigation) navigationKeyQueue.Dequeue();
+                navigationKeyQueue.Enqueue(vk);
+            }
+        }
 
         /// <summary>
         /// Rime Context 变化通知（由 Hook 线程 set，主线程在 Tick 中检测并消费）
@@ -72,9 +198,15 @@ namespace ChillPatcher.Patches
         /// </summary>
         public static void SetInputMode(bool gameMode)
         {
+            bool changed = isGameMode != gameMode;
             isGameMode = gameMode;
             string modeName = isGameMode ? "游戏模式（输入到游戏）" : "桌面模式（输入到系统）";
             Plugin.Logger.LogInfo($"[KeyboardHook] 设置输入模式: {modeName}");
+            if (changed && !gameMode)
+            {
+                Plugin.Logger.LogWarning("[KeyboardHook] 桌面输入模式下游戏内打字会失效（按键交给系统），" +
+                                         "按 F5 或点击面板上的输入模式按钮可切回游戏模式；F9 仍然可用。");
+            }
             InputModeDirty = true;
         }
 
@@ -87,7 +219,7 @@ namespace ChillPatcher.Patches
         private static readonly int maxRestartAttempts = 5;
         private static DateTime lastRestartTime = DateTime.MinValue;
         private static readonly TimeSpan restartCooldown = TimeSpan.FromSeconds(5);
-        private static DateTime lastHeartbeat = DateTime.Now;
+        private static long _lastHeartbeatTicks = DateTime.Now.Ticks;
         private static readonly object restartLock = new object();
         
         // Windows API
@@ -95,6 +227,21 @@ namespace ChillPatcher.Patches
         
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowsHookEx", CharSet = CharSet.Auto)]
+        private static extern IntPtr SetWindowsHookExMouse(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public int ptX;
+            public int ptY;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
 
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -112,6 +259,15 @@ namespace ChillPatcher.Patches
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetDesktopWindow();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetShellWindow();
+
         [DllImport("user32.dll")]
         private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
@@ -127,6 +283,13 @@ namespace ChillPatcher.Patches
 
         [DllImport("user32.dll")]
         private static extern void PostQuitMessage(int nExitCode);
+
+        [DllImport("user32.dll")]
+        private static extern uint MsgWaitForMultipleObjectsEx(
+            uint nCount, IntPtr pHandles, uint dwMilliseconds, uint dwWakeMask, uint dwFlags);
+
+        private const uint QS_ALLINPUT = 0x04FF;
+        private const uint MWMO_INPUTAVAILABLE = 0x0004;
 
         [DllImport("user32.dll")]
         private static extern bool OpenClipboard(IntPtr hWndNewOwner);
@@ -167,6 +330,8 @@ namespace ChillPatcher.Patches
 
         // 常量
         private const int WH_KEYBOARD_LL = 13;
+        private const int WH_MOUSE_LL = 14;
+        private const int WM_MOUSEWHEEL = 0x020A;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_KEYUP = 0x0101;
 
@@ -235,7 +400,7 @@ namespace ChillPatcher.Patches
         /// <summary>
         /// 钩子线程过程 - 带崩溃保护和自动重启
         /// </summary>
-        private static void HookThreadProc()
+        private static IntPtr InstallKeyboardHook()
         {
             try
             {
@@ -243,84 +408,168 @@ namespace ChillPatcher.Patches
                 using (var curProcess = System.Diagnostics.Process.GetCurrentProcess())
                 using (var curModule = curProcess.MainModule)
                 {
-                    hookId = SetWindowsHookEx(WH_KEYBOARD_LL, hookCallback, GetModuleHandle(curModule.ModuleName), 0);
+                    return SetWindowsHookEx(WH_KEYBOARD_LL, hookCallback, GetModuleHandle(curModule.ModuleName), 0);
                 }
+            }
+            catch (Exception ex)
+            {
+                try { Plugin.Logger.LogError("[KeyboardHook] 安装键盘钩子异常: " + ex.Message); } catch { }
+                return IntPtr.Zero;
+            }
+        }
 
-                if (hookId == IntPtr.Zero)
+        private static IntPtr InstallMouseHook()
+        {
+            try
+            {
+                mouseProc = MouseHookCallback;
+                using (var curProcess = System.Diagnostics.Process.GetCurrentProcess())
+                using (var curModule = curProcess.MainModule)
+                    return SetWindowsHookExMouse(WH_MOUSE_LL, mouseProc, GetModuleHandle(curModule.ModuleName), 0);
+            }
+            catch (Exception ex)
+            {
+                try { Plugin.Logger.LogWarning("[KeyboardHook] 安装鼠标钩子失败: " + ex.Message); } catch { }
+                return IntPtr.Zero;
+            }
+        }
+
+        /// <summary>在钩子线程内卸旧装新（低级钩子被系统摘掉后只能这样恢复）。</summary>
+        private static IntPtr Reinstall(IntPtr oldHandle)
+        {
+            if (oldHandle != IntPtr.Zero)
+            {
+                try { UnhookWindowsHookEx(oldHandle); } catch { }
+            }
+            if (hookId == oldHandle) hookId = IntPtr.Zero;
+
+            KeyEventConverter.ResetState();
+            var fresh = InstallKeyboardHook();
+            hookId = fresh;
+            Interlocked.Exchange(ref _lastHookEventTicks, DateTime.UtcNow.Ticks);
+
+            try
+            {
+                if (fresh != IntPtr.Zero) Plugin.Logger.LogWarning("[KeyboardHook] 钩子已重装");
+                else Plugin.Logger.LogError("[KeyboardHook] 钩子重装失败 (Win32=" + Marshal.GetLastWin32Error() + ")");
+            }
+            catch { }
+            return fresh;
+        }
+
+        private static void HookThreadProc()
+        {
+            // 句柄归本线程所有：重启/重装时绝不动其他线程的句柄，
+            // 否则旧线程的 finally 会把新线程刚装好的钩子卸掉（曾导致整机输入失效）。
+            IntPtr localHook = IntPtr.Zero;
+            IntPtr localMouse = IntPtr.Zero;
+            try
+            {
+                KeyEventConverter.ResetState();
+                _ctrlHeld = false;
+                _layoutF8Held = false;
+                _layoutF8Captured = false;
+                Interlocked.Exchange(ref _layoutTogglePending, 0);
+                Interlocked.Exchange(ref _reinstallRequested, 0);
+                Interlocked.Exchange(ref _lastHookEventTicks, DateTime.UtcNow.Ticks);
+
+                localHook = InstallKeyboardHook();
+                hookId = localHook;
+
+                localMouse = InstallMouseHook();
+                mouseHookId = localMouse;
+                try { Plugin.Logger.LogInfo("[KeyboardHook] 鼠标滚轮钩子: " + (localMouse != IntPtr.Zero ? "ok" : "failed")); } catch { }
+
+                if (localHook == IntPtr.Zero)
                 {
-                    Plugin.Logger.LogError("[KeyboardHook] 钩子设置失败");
+                    try { Plugin.Logger.LogError($"[KeyboardHook] 钩子设置失败 (Win32={Marshal.GetLastWin32Error()})"); } catch { }
                     TryRestartHookThread();
                     return;
                 }
 
-                Plugin.Logger.LogInfo("[KeyboardHook] 钩子设置成功，开始消息循环");
+                try { Plugin.Logger.LogInfo("[KeyboardHook] 钩子设置成功，开始消息循环"); } catch { }
                 restartCount = 0; // 成功启动后重置计数器
 
-                // 非阻塞消息循环 - 使用 PeekMessage 替代 GetMessage
+                uint waitTimeout = (uint)Math.Max(1, Math.Min(200, PluginConfig.KeyboardHookInterval.Value));
                 MSG msg;
                 while (isRunning)
                 {
                     try
                     {
                         // 更新心跳时间
-                        lastHeartbeat = DateTime.Now;
-                        
-                        // 非阻塞地检查消息
+                        Interlocked.Exchange(ref _lastHeartbeatTicks, DateTime.Now.Ticks);
+
+                        // 先把消息队列抽干
                         if (PeekMessage(out msg, IntPtr.Zero, 0, 0, PM_REMOVE))
                         {
                             if (msg.message == 0x0012) // WM_QUIT
                             {
-                                Plugin.Logger.LogInfo("[KeyboardHook] 收到 WM_QUIT 消息");
+                                try { Plugin.Logger.LogInfo("[KeyboardHook] 收到 WM_QUIT 消息"); } catch { }
                                 break;
                             }
-                            
+
                             TranslateMessage(ref msg);
                             DispatchMessage(ref msg);
+                            continue;
                         }
-                        else
+
+                        // 主线程判定钩子可能已被系统摘掉：就在本线程重装
+                        if (Interlocked.Exchange(ref _reinstallRequested, 0) != 0)
                         {
-                            // 没有消息时短暂休眠，避免 CPU 占用过高
-                            Thread.Sleep(PluginConfig.KeyboardHookInterval.Value);
+                            localHook = Reinstall(localHook);
                         }
+
+                        // 阻塞等待下一条消息而不是休眠：既不占 CPU，也不会给按键追加延迟
+                        uint wait = MsgWaitForMultipleObjectsEx(0, IntPtr.Zero, waitTimeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                        if (wait == 0xFFFFFFFF) Thread.Sleep((int)waitTimeout);
                     }
                     catch (Exception ex)
                     {
                         // 消息循环内的异常不应该导致整个线程崩溃
-                        Plugin.Logger.LogError($"[KeyboardHook] 消息处理异常(已隔离): {ex.Message}");
+                        try { Plugin.Logger.LogError($"[KeyboardHook] 消息处理异常(已隔离): {ex.Message}"); } catch { }
                         Thread.Sleep(100); // 短暂延迟避免异常循环
                     }
                 }
 
-                Plugin.Logger.LogInfo("[KeyboardHook] 消息循环退出");
+                try { Plugin.Logger.LogInfo("[KeyboardHook] 消息循环退出"); } catch { }
             }
             catch (ThreadAbortException)
             {
                 // Unity 退出时会中止后台线程，这是正常的
-                Plugin.Logger.LogInfo("[KeyboardHook] 线程被中止（正常退出）");
+                try { Plugin.Logger.LogInfo("[KeyboardHook] 线程被中止（正常退出）"); } catch { }
                 Thread.ResetAbort(); // 重置中止状态，防止异常传播
             }
             catch (Exception ex)
             {
-                Plugin.Logger.LogError($"[KeyboardHook] 线程崩溃: {ex.GetType().Name}: {ex.Message}");
-                Plugin.Logger.LogError($"[KeyboardHook] 堆栈: {ex.StackTrace}");
-                
+                try
+                {
+                    Plugin.Logger.LogError($"[KeyboardHook] 线程崩溃: {ex.GetType().Name}: {ex.Message}");
+                    Plugin.Logger.LogError($"[KeyboardHook] 堆栈: {ex.StackTrace}");
+                }
+                catch { }
+
                 // 尝试自动重启
                 TryRestartHookThread();
             }
             finally
             {
-                if (hookId != IntPtr.Zero)
+                try
                 {
-                    try
-                    {
-                        UnhookWindowsHookEx(hookId);
-                    }
-                    catch (Exception ex)
-                    {
-                        Plugin.Logger.LogError($"[KeyboardHook] 卸载钩子时异常: {ex.Message}");
-                    }
-                    hookId = IntPtr.Zero;
+                    if (localHook != IntPtr.Zero) UnhookWindowsHookEx(localHook);
                 }
+                catch (Exception ex)
+                {
+                    try { Plugin.Logger.LogError($"[KeyboardHook] 卸载钩子时异常: {ex.Message}"); } catch { }
+                }
+                try
+                {
+                    if (localMouse != IntPtr.Zero) UnhookWindowsHookEx(localMouse);
+                }
+                catch { }
+
+                // 只清理自己那一份，别把新线程装好的句柄抹掉
+                if (hookId == localHook) hookId = IntPtr.Zero;
+                if (mouseHookId == localMouse) mouseHookId = IntPtr.Zero;
             }
         }
 
@@ -339,6 +588,7 @@ namespace ChillPatcher.Patches
                 try
                 {
                     UnhookWindowsHookEx(hookId);
+            if (mouseHookId != IntPtr.Zero) { UnhookWindowsHookEx(mouseHookId); mouseHookId = IntPtr.Zero; }
                 }
                 catch { } // 忽略异常
                 hookId = IntPtr.Zero;
@@ -374,7 +624,15 @@ namespace ChillPatcher.Patches
         /// </summary>
         private static bool IsDesktopActive()
         {
-            IntPtr hwnd = GetForegroundWindow();
+            return IsDesktopWindowClass(GetForegroundWindow());
+        }
+
+        /// <summary>前台窗口是否是壁纸/桌面层（Progman / WorkerW / 桌面列表）。</summary>
+        private static bool IsDesktopWindowClass(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (hwnd == GetDesktopWindow() || hwnd == GetShellWindow()) return true;
+
             StringBuilder className = new StringBuilder(256);
             GetClassName(hwnd, className, 256);
             string classNameStr = className.ToString();
@@ -383,20 +641,205 @@ namespace ChillPatcher.Patches
             return classNameStr == "Progman" || classNameStr == "WorkerW" || classNameStr == "SysListView32";
         }
 
+        private static int _ownProcessId = -1;
+
+        /// <summary>本进程 PID（缓存一次，供输入归属判断使用）。</summary>
+        private static int OwnProcessId
+        {
+            get
+            {
+                int pid = _ownProcessId;
+                if (pid > 0) return pid;
+                try { pid = System.Diagnostics.Process.GetCurrentProcess().Id; }
+                catch { pid = 0; }
+                _ownProcessId = pid;
+                return pid;
+            }
+        }
+
+        /// <summary>前台窗口是否属于本进程（窗口模式下游戏在前台）。</summary>
+        private static bool IsOwnProcessWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            int own = OwnProcessId;
+            return own > 0 && pid == (uint)own;
+        }
+
+        /// <summary>
+        /// 键盘/剪贴板输入此刻是否仍应归本插件所有。
+        /// 前台已经不是桌面、也不是本进程窗口时（例如用户切到别的应用）一律归还系统，
+        /// 避免继续往壁纸层的输入框里塞字。
+        /// </summary>
+        internal static bool IsCaptureTargetActive()
+        {
+            if (ForceRimeForTest) return true;
+            if (!isGameMode) return false;
+            IntPtr fg = GetForegroundWindow();
+            if (IsOwnProcessWindow(fg)) return true;
+            return IsDesktopWindowClass(fg);
+        }
+
+        /// <summary>壁纸模式且桌面在最前：此时壁纸层收不到真实输入，需要钩子转发。</summary>
+        internal static bool IsWallpaperInputActive()
+        {
+            if (ForceRimeForTest) return true;
+            if (!isGameMode) return false;
+            return IsDesktopWindowClass(GetForegroundWindow());
+        }
+
+        /// <summary>
+        /// 主线程每帧调用：前台一旦离开我们的输入目标，立即丢弃残留输入、取消焦点恢复并清空组合，
+        /// 这样切回时不会突然补字/补发送。
+        /// </summary>
+        internal static void RefreshCaptureState()
+        {
+            bool active = IsCaptureTargetActive();
+            if (active)
+            {
+                _captureActive = true;
+                return;
+            }
+            if (_captureActive)
+            {
+                _captureActive = false;
+                DropPendingInput();
+                UIToolkitInputDispatcher.OnInputCaptureLost();
+            }
+        }
+
+        /// <summary>丢弃所有尚未消费的输入（不触碰输入框里已有的草稿）。</summary>
+        private static void DropPendingInput()
+        {
+            lock (queueLock)
+            {
+                _returnEpoch++;
+                inputQueue.Clear();
+                commitQueue.Clear();
+                navigationKeyQueue.Clear();
+                clipActionQueue.Clear();
+                returnQueue.Clear();
+                _pendingPasteText = null;
+            }
+            Interlocked.Exchange(ref wheelDeltaPending, 0);
+
+            // 立刻让候选窗/拼音显示消失，不等下一次按键
+            try
+            {
+                lock (rimeContextCacheLock)
+                {
+                    cachedRimeContext = null;
+                    RimeContextDirty = true;
+                }
+            }
+            catch { }
+
+            RimeResetPending = true; // 组合状态由钩子线程独占，异步重置
+        }
+
+        /// <summary>
+        /// 鼠标钩子回调：只累积滚轮增量，供壁纸模式下的鼠标桥派发。
+        /// </summary>
+        private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                if (nCode >= 0 && wParam == (IntPtr)WM_MOUSEWHEEL && IsWallpaperInputActive())
+                {
+                    var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                    int delta = (short)((info.mouseData >> 16) & 0xFFFF);
+                    if (delta != 0) Interlocked.Add(ref wheelDeltaPending, delta);
+                }
+            }
+            catch { }
+            return CallNextHookEx(mouseHookId, nCode, wParam, lParam);
+        }
+
         /// <summary>
         /// 键盘钩子回调
         /// </summary>
         private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
+            // 记录“钩子还活着”的时间戳，供主线程判断是否被系统摘钩
+            Interlocked.Exchange(ref _lastHookEventTicks, DateTime.UtcNow.Ticks);
+            _hookEventCount++;
+
+            try
+            {
+                return HookCallbackCore(nCode, wParam, lParam);
+            }
+            catch (Exception ex)
+            {
+                // 异常绝不允许穿过原生回调边界（会直接打断钩子链）
+                long now = DateTime.UtcNow.Ticks;
+                if (now - Interlocked.Read(ref _lastCallbackErrorTicks) > TimeSpan.TicksPerSecond * 5)
+                {
+                    Interlocked.Exchange(ref _lastCallbackErrorTicks, now);
+                    try { Plugin.Logger.LogError("[KeyboardHook] 回调异常(已隔离): " + ex.GetType().Name + ": " + ex.Message); } catch { }
+                }
+                return CallNextHookEx(hookId, nCode, wParam, lParam);
+            }
+        }
+
+        private static IntPtr HookCallbackCore(int nCode, IntPtr wParam, IntPtr lParam)
+        {
             if (nCode >= 0)
             {
                 KBDLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                uint vkCode = hookStruct.vkCode;
+                uint vkCode = hookStruct.vkCode; KeyEventConverter.ObserveKey(vkCode, (int)wParam);
+
+                // 主线程已判定前台离开我们的输入目标：由钩子线程清掉未提交的组合。
+                if (RimeResetPending)
+                {
+                    RimeResetPending = false;
+                    try
+                    {
+                        if (useRime && rimeEngine != null)
+                        {
+                            rimeEngine.ClearComposition();
+                            UpdateCachedRimeContext();
+                        }
+                    }
+                    catch { }
+                }
+
+                // 回车抬起一律复位，避免组合期间的按下/抬起错位导致后续回车失效。
+                if ((vkCode == 0x0D || vkCode == 0x0A) &&
+                    (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)0x0105))
+                {
+                    _enterHeld = false;
+                }
 
                 // 跟踪 Ctrl 修饰键状态（WM_KEYDOWN + WM_KEYUP），低级钩子中 GetAsyncKeyState 不可靠
                 if (vkCode == 0x11 || vkCode == 0xA2 || vkCode == 0xA3) // VK_CONTROL / VK_LCONTROL / VK_RCONTROL
                 {
                     _ctrlHeld = (wParam == (IntPtr)WM_KEYDOWN);
+                }
+
+                // Capture desktop F8 before Rime/simple input can consume it.
+                // Swallow the captured press (including repeats/release) so Unity
+                // cannot also toggle from the same physical key press.
+                if (false && vkCode == 0x77) // F8 editor disabled; do not capture this key
+                {
+                    if (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)0x0104)
+                    {
+                        if (!_layoutF8Held)
+                        {
+                            _layoutF8Held = true;
+                            _layoutF8Captured = isGameMode && IsDesktopActive();
+                            if (_layoutF8Captured)
+                                Interlocked.Exchange(ref _layoutTogglePending, 1);
+                        }
+                        if (_layoutF8Captured) return (IntPtr)1;
+                    }
+                    else if (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)0x0105)
+                    {
+                        bool captured = _layoutF8Captured;
+                        _layoutF8Held = false;
+                        _layoutF8Captured = false;
+                        if (captured) return (IntPtr)1;
+                    }
                 }
 
                 if (wParam == (IntPtr)WM_KEYDOWN)
@@ -419,8 +862,8 @@ namespace ChillPatcher.Patches
                         return (IntPtr)1; // 拦截 F6
                     }
 
-                    // Ctrl 组合键（剪贴板操作）—— 与模式无关，仅在 UIToolkit TextField 获焦时拦截
-                    if (_ctrlHeld && UIToolkitInputDispatcher.IsUIToolkitTextFieldFocused)
+                    // Ctrl 组合键（剪贴板操作）—— 仅在 UIToolkit TextField 获焦且输入仍归我们时拦截
+                    if (_ctrlHeld && UIToolkitInputDispatcher.IsUIToolkitTextFieldFocused && IsCaptureTargetActive())
                     {
                         if (vkCode == 0x56) // Ctrl+V: 粘贴
                         {
@@ -452,19 +895,52 @@ namespace ChillPatcher.Patches
                         }
                     }
 
+                    // F9 切换小组件面板：必须在“桌面模式直接放行”之前处理，
+                    // 否则一旦切到桌面模式（例如误点面板上的输入模式按钮），F9 就彻底失效，
+                    // 用户既打不了字也调不出面板，只能重启游戏。
+                    if (vkCode == 0x78)
+                    {
+                        if (wParam == (IntPtr)WM_KEYDOWN) UiTogglePending = true;
+                        return (IntPtr)1;
+                    }
+
                     // 桌面模式：不拦截任何输入，让系统处理
                     if (!isGameMode)
                     {
                         return CallNextHookEx(hookId, nCode, wParam, lParam);
                     }
 
-                    // 游戏模式：检测是否在桌面（只在桌面激活时拦截输入到游戏）
-                    bool isDesktop = IsDesktopActive();
+                    // 游戏模式：只有桌面在前台时才由钩子接管输入（窗口模式交给 Unity 原生处理）
+                    bool isDesktop = IsWallpaperInputActive();
 
                     if (isDesktop)
                     {
                         if (useRime && rimeEngine != null)
                         {
+
+                            // 回车：无拼音时作为“发送”（Shift+回车 = 换行）
+                            if (vkCode == 0x0D || vkCode == 0x0A)
+                            {
+                                if (!HasRimePreedit())
+                                {
+                                    if (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)0x0104)
+                                    {
+                                        // 一次物理按压只登记一次，长按不重复发送
+                                        if (!_enterHeld)
+                                        {
+                                            _enterHeld = true;
+                                            EnqueueReturn(KeyEventConverter.ShiftHeld);
+                                        }
+                                    }
+                                    return (IntPtr)1;
+                                }
+
+                                // 有组合时先让 Rime 提交/处理，不触发聊天发送
+                                ProcessKeyWithRime(vkCode);
+                                TMP_InputField_LateUpdate_Patch.RequestRimeUpdate();
+                                return (IntPtr)1;
+                            }
+
                             // 使用Rime处理输入
                             ProcessKeyWithRime(vkCode);
 
@@ -500,7 +976,13 @@ namespace ChillPatcher.Patches
                 // 检查Rime引擎是否健康
                 if (rimeEngine == null || !rimeEngine.IsInitialized)
                 {
-                    Plugin.Logger.LogWarning("[Rime] 引擎未初始化,降级为简单模式");
+                    // 逐键告警会在钩子线程上刷日志，最多每 30 秒提示一次
+                    long now = DateTime.UtcNow.Ticks;
+                    if (now - Interlocked.Read(ref _lastRimeUninitWarnTicks) > TimeSpan.TicksPerSecond * 30)
+                    {
+                        Interlocked.Exchange(ref _lastRimeUninitWarnTicks, now);
+                        try { Plugin.Logger.LogWarning("[Rime] 引擎未初始化,降级为简单模式"); } catch { }
+                    }
                     ProcessKeySimple(vkCode);
                     return;
                 }
@@ -508,7 +990,7 @@ namespace ChillPatcher.Patches
                 // 使用 Weasel 风格的按键转换
                 if (!KeyEventConverter.ConvertKeyEvent(vkCode, 0, out int keycode, out int mask))
                 {
-                    Plugin.Logger.LogWarning($"[Rime] 无法转换按键 vk={vkCode:X2}");
+                    // 逐键告警会让低级钩子拖慢整机输入，改为不输出的静默跳过
                     return;
                 }
 
@@ -527,11 +1009,8 @@ namespace ChillPatcher.Patches
                     string commit = rimeEngine.GetCommit();
                     if (!string.IsNullOrEmpty(commit))
                     {
-                        lock (queueLock)
-                        {
-                            commitQueue.Enqueue(commit);
-                            Plugin.Logger.LogInfo($"[Rime] 提交文本: {commit}");
-                        }
+                        // 不在钩子线程打印正文，避免卡顿与隐私问题
+                        EnqueueCommit(commit);
                     }
                     
                     // 更新缓存的 Context（在 Hook 线程中调用 Rime API）
@@ -593,24 +1072,24 @@ namespace ChillPatcher.Patches
             // 处理特殊按键
             if (vkCode == 0x08) // Backspace
             {
-                lock (queueLock) { inputQueue.Enqueue('\b'); }
+                EnqueueInputChar('\b');
                 return true;
             }
-            else if (vkCode == 0x0D) // Enter
+            else if (vkCode == 0x0D) // Enter：与 Rime 模式统一走回车队列，保留 Shift 语义
             {
-                lock (queueLock) { inputQueue.Enqueue('\n'); }
+                EnqueueReturn(KeyEventConverter.ShiftHeld);
                 return true;
             }
 
             // 方向键/Delete: 加入导航键队列
             if (vkCode >= 0x25 && vkCode <= 0x28) // Left, Up, Right, Down
             {
-                lock (queueLock) { navigationKeyQueue.Enqueue(vkCode); }
+                EnqueueNavigation(vkCode);
                 return true;
             }
             if (vkCode == 0x2E) // Delete
             {
-                lock (queueLock) { navigationKeyQueue.Enqueue(vkCode); }
+                EnqueueNavigation(vkCode);
                 return true;
             }
 
@@ -624,7 +1103,7 @@ namespace ChillPatcher.Patches
                     char ch = (char)keycode;
                     if (!char.IsControl(ch))
                     {
-                        lock (queueLock) { inputQueue.Enqueue(ch); }
+                        EnqueueInputChar(ch);
                         return true;
                     }
                 }
@@ -748,8 +1227,7 @@ namespace ChillPatcher.Patches
         /// 获取Rime上下文（preedit和候选词）
         /// 线程安全：从缓存读取，不直接调用 Rime API（避免多线程竞态）
         /// </summary>
-        public static RimeContextInfo GetRimeContext()
-        {
+        public static RimeContextInfo GetRimeContext()        {
             if (!useRime || rimeEngine == null)
                 return null;
             
@@ -772,6 +1250,18 @@ namespace ChillPatcher.Patches
         /// 检查Rime是否有未完成的composition(preedit)
         /// 这个方法更轻量,不会触发复杂的context获取
         /// </summary>
+        /// <summary>Diagnostic: push ASCII letters through the Rime path without OS input.</summary>
+        public static void DebugTypeAscii(string text)
+        {
+            if (string.IsNullOrEmpty(text) || rimeEngine == null) return;
+            foreach (var ch in text)
+                ProcessKeyWithRime((byte)char.ToUpperInvariant(ch));
+            var ctx = GetRimeContext();
+            Plugin.Logger.LogInfo("[RimeSelfTest] ctx=" + (ctx == null ? "null" :
+                ("preedit='" + ctx.Preedit + "' candidates=" +
+                 (ctx.Candidates == null ? 0 : ctx.Candidates.Count))));
+        }
+
         public static bool HasRimePreedit()
         {
             if (!useRime || rimeEngine == null || !rimeEngine.IsInitialized)
@@ -779,9 +1269,9 @@ namespace ChillPatcher.Patches
             
             // 使用队列判断:如果有commit队列,说明有输入
             // 或者检查是否有按键事件正在处理
-            lock (queueLock)
+            lock (rimeContextCacheLock)
             {
-                return commitQueue.Count > 0;
+                return cachedRimeContext != null && !string.IsNullOrEmpty(cachedRimeContext.Preedit);
             }
         }
 
@@ -897,36 +1387,27 @@ namespace ChillPatcher.Patches
         }
 
         /// <summary>
-        /// 清空所有输入（Rime和队列）
+        /// 清空所有待处理输入（Rime 组合、字符、提交、导航、剪贴板、回车）。
+        /// 只清待处理数据，不动输入框里已有的草稿。
         /// </summary>
         public static void ClearAll()
         {
+            // 组合状态的清理交给独占 Rime 的钩子线程执行，避免跨线程调用
+            if (useRime && rimeEngine != null)
+                RimeResetPending = true;
+
+            // 清空缓存的 Context
             try
             {
-                // 清空Rime待提交
-                if (useRime && rimeEngine != null)
-                {
-                    rimeEngine.ClearComposition();
-                }
-                
-                // 清空缓存的 Context
                 lock (rimeContextCacheLock)
                 {
                     cachedRimeContext = null;
                     RimeContextDirty = true;
                 }
             }
-            catch (Exception ex)
-            {
-                Plugin.Logger.LogError($"[Rime] 清空组合失败(已忽略): {ex.Message}");
-            }
-            
-            // 清空队列
-            lock (queueLock)
-            {
-                inputQueue.Clear();
-                commitQueue.Clear();
-            }
+            catch { }
+
+            DropPendingInput();
         }
         
         /// <summary>
@@ -960,18 +1441,29 @@ namespace ChillPatcher.Patches
                 
                 try
                 {
-                    // 清理旧线程
-                    if (hookThread != null && hookThread.IsAlive)
+                    // 先请旧线程自己退出（不发 PostQuitMessage：它只会投递到调用它的线程）
+                    var old = hookThread;
+                    isRunning = false;
+                    if (old != null && old != Thread.CurrentThread && old.IsAlive)
                     {
-                        PostQuitMessage(0);
-                        Thread.Sleep(200); // 等待旧线程退出
+                        old.Join(800);
+                        if (old.IsAlive)
+                        {
+                            Plugin.Logger.LogWarning("[KeyboardHook] 旧钩子线程未在 0.8s 内退出，继续新建（旧线程的句柄由它自己回收）");
+                        }
                     }
-                    
+
+                    // 句柄已经由旧线程在 finally 里回收；这里只清空我们自己的记录
+                    hookId = IntPtr.Zero;
+                    mouseHookId = IntPtr.Zero;
+
                     // 启动新线程
                     isRunning = true;
-                    hookThread = new Thread(HookThreadProc);
-                    hookThread.IsBackground = true;
-                    hookThread.Start();
+                    var thread = new Thread(HookThreadProc);
+                    thread.IsBackground = true;
+                    thread.Name = "ChillPatcher.KeyboardHook";
+                    hookThread = thread;
+                    thread.Start();
                     
                     Plugin.Logger.LogInfo($"[KeyboardHook] 钩子线程重启成功");
                 }
@@ -1018,38 +1510,87 @@ namespace ChillPatcher.Patches
         }
         
         /// <summary>
-        /// 健康检查 - 由Unity主线程调用
+        /// 健康检查 - 由Unity主线程每帧调用
+        ///
+        /// 三道防线：
+        ///  1. 线程死了 → 重新起线程；
+        ///  2. 心跳超时 → 让钩子线程自己重装钩子（不要另起线程，否则两个钩子互相顶掉）；
+        ///  3. 钩子还“活着”但系统已经把它摘掉（低级钩子回调超时会被 Windows 静默移除）
+        ///     → 用 GetAsyncKeyState 探测“物理上确实按了键，但钩子没收到”，然后重装。
         /// </summary>
         public static void HealthCheck()
         {
-            // 如果键盘钩子被禁用，跳过健康检查
-            if (!PluginConfig.EnableKeyboardHook.Value)
-            {
-                return;
-            }
+            if (!PluginConfig.EnableKeyboardHook.Value) return;
 
             try
             {
-                // 检查钩子线程是否存活
-                if (isRunning && (hookThread == null || !hookThread.IsAlive))
+                if (!isRunning) return;
+
+                // 1. 钩子线程存活
+                if (hookThread == null || !hookThread.IsAlive)
                 {
                     Plugin.Logger.LogWarning("[KeyboardHook] 检测到钩子线程已死亡,尝试重启...");
                     TryRestartHookThread();
                     return;
                 }
-                
-                // 检查心跳(超过10秒无心跳视为卡死)
-                if (isRunning && (DateTime.Now - lastHeartbeat).TotalSeconds > 10)
+
+                // 2. 心跳（线程卡死，例如 Rime 部署、日志锁等长时间阻塞）
+                double stale = (DateTime.Now.Ticks - Interlocked.Read(ref _lastHeartbeatTicks)) / (double)TimeSpan.TicksPerSecond;
+                if (stale > 10)
                 {
-                    Plugin.Logger.LogWarning($"[KeyboardHook] 检测到线程无响应(心跳超时 {(DateTime.Now - lastHeartbeat).TotalSeconds:F1}s),尝试重启...");
-                    TryRestartHookThread();
+                    Plugin.Logger.LogWarning($"[KeyboardHook] 检测到线程无响应(心跳超时 {stale:F1}s),请求重装钩子");
+                    Interlocked.Exchange(ref _reinstallRequested, 1);
+                    Interlocked.Exchange(ref _lastHeartbeatTicks, DateTime.Now.Ticks); // 避免每帧刷日志
                     return;
                 }
+
+                // 3. 钩子可能已被系统静默摘除
+                ProbeHookLiveness();
             }
             catch (Exception ex)
             {
                 Plugin.Logger.LogError($"[KeyboardHook] 健康检查异常: {ex.Message}");
             }
+        }
+
+        /// <summary>打字时最可能按到的键，用于判断“用户确实在按键”。</summary>
+        private static readonly int[] LivenessProbeKeys =
+        {
+            0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x51, 0x52, 0x53, 0x54, 0x57,
+            0x20, 0x0D, 0x08, 0x09, 0x1B, 0x31, 0x32, 0x33,
+        };
+
+        /// <summary>
+        /// 用 GetAsyncKeyState 的“自上次调用后被按过”位做探针：
+        /// 物理按键发生了，但钩子回调没刷新时间戳，就说明钩子被摘掉了，需要重装。
+        /// </summary>
+        private static void ProbeHookLiveness()
+        {
+            if (!isGameMode) return;                    // 桌面模式本来就不接管输入
+            if (hookId == IntPtr.Zero) return;
+
+            long now = DateTime.UtcNow.Ticks;
+            if (now < Interlocked.Read(ref _nextProbeTicks)) return;
+            Interlocked.Exchange(ref _nextProbeTicks, now + TimeSpan.TicksPerSecond);
+
+            // 只有“当下确实该由我们收键”的时候才判断，切到别的应用时按键本来就不归我们
+            if (!IsCaptureTargetActive()) { _hookDeadStrikes = 0; return; }
+
+            bool pressedAny = false;
+            foreach (int vk in LivenessProbeKeys)
+            {
+                if ((GetAsyncKeyState(vk) & 0x0001) != 0) { pressedAny = true; break; }
+            }
+            if (!pressedAny) { _hookDeadStrikes = 0; return; }
+
+            double idle = SecondsSinceHookEvent;
+            if (idle < 1.5) { _hookDeadStrikes = 0; return; }
+
+            if (++_hookDeadStrikes < 2) return;
+            _hookDeadStrikes = 0;
+
+            Plugin.Logger.LogWarning($"[KeyboardHook] 检测到按键未被钩子接收（{idle:F1}s 无回调），请求重装钩子");
+            Interlocked.Exchange(ref _reinstallRequested, 1);
         }
     }
 

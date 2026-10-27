@@ -47,6 +47,9 @@ namespace ChillPatcher.Patches.UIFramework
         /// 防止 Seek(0) 后 IsEndOfStream 还未清除时重复触发 EOF
         /// </summary>
         private static bool _isLoopSeeking = false;
+        private static float _loopSeekAt = 0f;
+        /// <summary>单曲循环切歌过渡时只静音音乐通道（环境音/角色语音不受影响）。</summary>
+        internal static bool LoopMuteMusic;
 
         /// <summary>
         /// 超时保护：上次播放位置变化的时间
@@ -83,15 +86,42 @@ namespace ChillPatcher.Patches.UIFramework
                     // 【重要】不重置 _lastEofTriggeredStreamId，防止 Seek(0) 后
                     // IsEndOfStream 还没清除时重复触发 EOF
                     // 改用 _isLoopSeeking 标志，等 IsEndOfStream 清除后再重置
+                    // 重新播放同一首歌：先把读取器拨回开头，再走一次“选中该曲播放”
+                    // （MusicManager.Play 会新建 AudioSource，旧音频源已停在 EOF）
+                    // 借道“切下一首→瞬间切回本首”：两次都是真正的换曲，会重建音频流，
+                    // 从而绕开“同一首复用已结束的流”导致的无声音问题。
                     _isSkippingToNext = false;
                     _isLoopSeeking = true;
+                    _loopSeekAt = Time.time;
+                    ResetEofTracking();
+                    try
+                    {
+                        // 只静音音乐通道，环境音/角色语音不受影响
+                        LoopMuteMusic = true;
+                        ChillPatcher.UIFramework.Music.PlayQueueManager.SuppressHistoryAdds = 2;
+                        bool okNext = await musicService.SkipCurrentMusic(MusicChangeKind.Auto);
+                        musicService.PlayArugumentMusic(currentAudio, MusicChangeKind.Manual);
+                        await Cysharp.Threading.Tasks.UniTask.NextFrame();
+                        await Cysharp.Threading.Tasks.UniTask.NextFrame();
+                        LoopMuteMusic = false;
+                        Plugin.Log.LogInfo("[AudioPlayer_Patch] Single loop: switched back immediately (ok=" + okNext + ")");
+                        _lastKnownProgress = 0f;
+                        _lastProgressChangeTime = Time.time;
+                        _lastEofTriggeredStreamId = null;
+                        _isLoopSeeking = false;
+                        return;
+                    }
+                    catch (System.Exception ex)
+                    {
+                        AudioListener.volume = 1f;
+                        LoopMuteMusic = false;
+                        Plugin.Log.LogWarning("[AudioPlayer_Patch] Single loop skip/back failed: " + ex.Message);
+                    }
 
-                    // 重新播放同一首歌（使用 Seek 到开头）
                     var reader = MusicService_SetProgress_Patch.ActivePcmReader;
                     if (reader != null)
                     {
                         reader.Seek(0);
-                        // 重置进度追踪，避免超时误触发
                         _lastKnownProgress = 0f;
                         _lastProgressChangeTime = Time.time;
                         return;
@@ -195,6 +225,18 @@ namespace ChillPatcher.Patches.UIFramework
             // 【超时保护】只在播放超过原始时长后才启用检查
             // 这样可以避免正常播放过程中误触发
             float originalDuration = reader?.Info?.Duration ?? 0f;
+
+            // 安全兜底：循环标记长时间未清除会让 EOF 永不再触发，
+            // 表现为“播到结尾停住、进度不重跑、循环开关失效”。
+            if (_isLoopSeeking && _loopSeekAt > 0f && Time.time - _loopSeekAt > 5f)
+            {
+                _isLoopSeeking = false;
+                _loopSeekAt = 0f;
+                _lastEofTriggeredStreamId = null;
+                _isSkippingToNext = false;
+                Plugin.Log.LogInfo("[AudioPlayer_Patch] stale loop-seek flag cleared");
+            }
+
             bool isPassedOriginalDuration = originalDuration > 0 && currentProgress >= originalDuration - 1f; // 提前1秒开始检查
 
             if (Mathf.Abs(currentProgress - _lastKnownProgress) > 0.1f)
@@ -385,6 +427,18 @@ namespace ChillPatcher.Patches.UIFramework
 
             // 使用原始逻辑
             return true;
+        }
+    }
+
+    // 只把音乐通道拉到静音，环境音/角色语音音量保持不变。
+    [HarmonyPatch(typeof(Bulbul.AudioMixerGroupContainer), "GetDecibel")]
+    internal static class LoopMusicMute_Patch
+    {
+        [HarmonyPostfix]
+        private static void Postfix(Bulbul.AudioMixerType audioMixerType, ref float __result)
+        {
+            if (audioMixerType == Bulbul.AudioMixerType.Music && AudioPlayer_Update_Patch.LoopMuteMusic)
+                __result = -80f;
         }
     }
 }
