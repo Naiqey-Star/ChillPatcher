@@ -242,6 +242,15 @@ namespace ChillPatcher.JSApi
         }
 
         /// <summary>
+        /// 打断当前回复（打断朗读并停止后续合成），供面板「打断并发送」使用。
+        /// 打断点会传给下一轮请求，让模型知道玩家听到哪儿。
+        /// </summary>
+        public string interrupt()
+        {
+            var ok = AIChatBridge.TryInterrupt(out var error);
+            return ToResult(ok, error);
+        }
+        /// <summary>
         /// 每显示一句字幕回调一次（参数是这句的中文文本）。
         /// 用于聊天记录按句推送气泡。
         /// </summary>

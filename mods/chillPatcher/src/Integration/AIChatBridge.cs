@@ -287,6 +287,34 @@ namespace ChillPatcher.Integration
             }
         }
 
+        public static bool TryInterrupt(out string error)
+        {
+            error = string.Empty;
+            var instance = GetAiChatInstance();
+            if (instance == null)
+            {
+                error = "AIChat not installed";
+                return false;
+            }
+
+            try
+            {
+                var method = instance.GetType().GetMethod("InterruptConversation", BindingFlags.Instance | BindingFlags.Public);
+                if (method == null)
+                {
+                    error = "method not found: InterruptConversation";
+                    return false;
+                }
+
+                var result = method.Invoke(instance, null);
+                return result is bool ok && ok;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
         public static bool TrySubscribeSegmentShown(Action<string> onSegment, out string error)
         {
             error = string.Empty;

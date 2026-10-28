@@ -256,6 +256,7 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const [draft,setDraft] = useState<KV>({})
   const [defaults,setDefaults] = useState<KV>({})
   const [status,setStatus] = useState<any>({available:false})
+  const [busy,setBusy] = useState(false)
   const [msgs,setMsgs] = useState<Msg[]>(() => loadHistory())
   const [panelW,setPanelW] = useState(420)
   const [panelH,setPanelH] = useState(360)
@@ -283,6 +284,17 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
     }, 80)
     return ()=>clearInterval(id as any)
   },[rec])
+
+  useEffect(()=>{
+    const id = setInterval(()=>{
+      try {
+        const s = JSON.parse(chill.aichat.getStatus())
+        setStatus(s)
+        setBusy(!!s.isBusy)
+      } catch (_) {}
+    }, 800)
+    return ()=>clearInterval(id as any)
+  },[])
 
   const vuStyle = useMemo(()=>({
     width: compact ? 14 : 18,
@@ -351,12 +363,10 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
     if (followRef.current) setScrollY(clampY(contentH - viewH))
   },[contentH, viewH, msgs.length])
 
-  const send = ()=>{
+  const doSend = (text: string) => {
     const f = fieldRef.current
     const ve = f?.ve ?? f
-    const text = String(ve?.value ?? prompt ?? "")
-    if (!text.trim()) return
-    const r = call("startTextConversation",text,"wm-plugin")
+    const r = call("startTextConversation", text, "wm-plugin")
     if (r.ok) {
       segCountRef.current = 0
       appendMsgs([{ id: Date.now(), role: "user", text: text.trim() }])
@@ -370,6 +380,39 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
         try{ if (ve?.Focus) ve.Focus(); else if (f.focus) f.focus() }catch(_){}
       }, 0)
     }
+  }
+
+  const clearInput = () => {
+    const f = fieldRef.current
+    const ve = f?.ve ?? f
+    if (ve) {
+      if (ve.SetValueWithoutNotify) ve.SetValueWithoutNotify("")
+      else ve.value = ""
+    }
+    setPrompt("")
+  }
+
+  const send = ()=>{
+    const f = fieldRef.current
+    const ve = f?.ve ?? f
+    const text = String(ve?.value ?? prompt ?? "")
+    if (!text.trim()) return
+
+    // AI 还在说话：先打断，再立刻把新消息发出去
+    if (busy) {
+      let interrupted = false
+      try {
+        if (typeof chill.aichat.interrupt === "function") {
+          const r = JSON.parse(chill.aichat.interrupt() || "{}")
+          interrupted = !!r.ok
+        }
+      } catch (_) {}
+      clearInput()
+      setTimeout(()=>{ setBusy(false); doSend(text) }, interrupted ? 180 : 60)
+      return
+    }
+
+    doSend(text)
   }
   const micDown = ()=>{ const r = call("startVoiceCapture"); if (r.ok) setRec(true) }
   const micUp = ()=>{ const r = call("stopVoiceCaptureAndSend","wm-plugin"); setRec(false); if (!r.ok) console.log(r.error) }
@@ -489,7 +532,7 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
       </div>
 
       <div onPointerDown={send}
-        style={{width:sendW,height:inputH,marginLeft:6,backgroundColor:"#3b82f6",borderRadius:6,display:"Flex",alignItems:"Center",justifyContent:"Center",fontSize:12,color:"#ffffff"}}>发送</div>
+        style={{width:sendW,height:inputH,marginLeft:6,backgroundColor:busy?"#f59e0b":"#3b82f6",borderRadius:6,display:"Flex",alignItems:"Center",justifyContent:"Center",fontSize:busy?11:12,color:"#ffffff"}}>{busy?"打断":"发送"}</div>
     </div>
 
     <div style={{display:"Flex",flexDirection:"Row",marginTop:6,flexShrink:0}}>
