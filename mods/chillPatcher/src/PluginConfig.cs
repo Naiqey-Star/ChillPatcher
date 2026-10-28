@@ -59,6 +59,10 @@ namespace ChillPatcher
         public static ConfigEntry<float> TagDropdownHeightMultiplier { get; private set; }
         public static ConfigEntry<float> TagDropdownHeightOffset { get; private set; }
         public static ConfigEntry<int> MaxTagsInTitle { get; private set; }
+
+        // 滚动条按住缓动（微调列表用）
+        public static ConfigEntry<bool> ScrollHoldRampEnabled { get; private set; }
+        public static ConfigEntry<float> ScrollHoldRampSeconds { get; private set; }
         public static ConfigEntry<bool> CleanInvalidMusicData { get; private set; }
 
         // 音频自动静音设置
@@ -289,6 +293,26 @@ namespace ChillPatcher
                     "超过此数量将显示'等其他'\n" +
                     "默认：3",
                     new AcceptableValueRange<int>(1, 10)
+                )
+            );
+
+            ScrollHoldRampEnabled = config.Bind(
+                "UI",
+                "ScrollHoldRampEnabled",
+                true,
+                "按住滚动条滑轨空白处时，滚动速度从慢到快缓动加速（方便微调查找歌曲）\n" +
+                "false = 保持游戏原本的固定速度\n" +
+                "默认：true"
+            );
+
+            ScrollHoldRampSeconds = config.Bind(
+                "UI",
+                "ScrollHoldRampSeconds",
+                3f,
+                new ConfigDescription(
+                    "按住多久达到满速（秒）。从 0 开始线性加速，达到此时间后维持原速不再变快\n" +
+                    "默认：3",
+                    new AcceptableValueRange<float>(0.2f, 15f)
                 )
             );
 
