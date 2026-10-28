@@ -16,7 +16,7 @@ const groups: Record<string, string[]> = {
   "2. TTS": ["TTS_Service_URL","TTS_Service_Script_Path","LaunchTTSService","QuitTTSServiceOnQuit","Audio_File_Path","AudioPathCheck","Audio_File_Text","PromptLang","TargetLang","JapaneseCheck","VoiceVolume"],
   "3. UI": ["WindowWidth","WindowHeightBase","ReverseEnterBehavior","BackgroundOpacity","ShowWindowTitle"],
   "4. Persona": ["ExperimentalMemory","SystemPrompt"],
-  "5. Avatar": ["AvatarAI","AvatarUser"],
+  "Avatar": ["AvatarAI","AvatarUser"],
 }
 const multilineKeys = new Set(["Audio_File_Text", "SystemPrompt"])
 
@@ -100,7 +100,7 @@ const SavePanel = ({draft,defaults,setDraft,onCancel,onOk,status}:{draft:KV;defa
     <div style={{flexGrow:1,flexShrink:1,minHeight:120,backgroundColor:"#0b122099",borderWidth:1,borderColor:"#1f2937",borderRadius:6,padding:6,overflow:"Hidden"}}
       onGeometryChanged={(e:any)=>setContentHeight(Math.max(120, Math.floor(e?.newRect?.height ?? e?.target?.layout?.height ?? 220)))}>
       {displayFields.map(row)}
-      {currentGroup === "4. Persona" && <div style={{fontSize:9,color:"#64748b",marginTop:4,flexShrink:0}}>SystemPrompt 建议手动粘贴完整内容后再点击确定保存。</div>}      {currentGroup === "5. Avatar" && <div style={{display:"Flex",flexDirection:"Column",marginTop:6,flexShrink:0}}>
+      {currentGroup === "4. Persona" && <div style={{fontSize:9,color:"#64748b",marginTop:4,flexShrink:0}}>SystemPrompt 建议手动粘贴完整内容后再点击确定保存。</div>}      {currentGroup === "Avatar" && <div style={{display:"Flex",flexDirection:"Column",marginTop:6,flexShrink:0}}>
         <div style={{display:"Flex",flexDirection:"Row",alignItems:"Center",marginBottom:6}}>
           <Avatar role="ai" size={44} path={String(draft["AvatarAI"] ?? "")} />
           <div style={{marginLeft:10,fontSize:9,color:"#64748b",whiteSpace:"Normal"}}>角色头像预览（AI）</div>
