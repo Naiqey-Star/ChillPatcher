@@ -24,6 +24,9 @@ namespace ChillPatcher.JSApi
         private readonly Dictionary<string, Action<Dictionary<string, string>>> _eventHandlers
             = new Dictionary<string, Action<Dictionary<string, string>>>();
 
+        private readonly Dictionary<string, Action<string>> _segmentHandlers
+            = new Dictionary<string, Action<string>>();
+
         public ChillAIChatApi(ManualLogSource logger)
         {
             _logger = logger;
@@ -238,6 +241,51 @@ namespace ChillPatcher.JSApi
             return removed;
         }
 
+        /// <summary>
+        /// 每显示一句字幕回调一次（参数是这句的中文文本）。
+        /// 用于聊天记录按句推送气泡。
+        /// </summary>
+        public string onSegmentShown(Action<string> handler)
+        {
+            if (handler == null) return string.Empty;
+
+            var token = Guid.NewGuid().ToString("N");
+            Action<string> callback = text =>
+            {
+                try { handler(text ?? string.Empty); }
+                catch (Exception ex) { _logger.LogWarning($"[AIChatApi] onSegmentShown handler error: {ex.Message}"); }
+            };
+
+            if (!AIChatBridge.TrySubscribeSegmentShown(callback, out var error))
+            {
+                _logger.LogWarning($"[AIChatApi] subscribe SegmentShown failed: {error}");
+                return string.Empty;
+            }
+
+            _segmentHandlers[token] = callback;
+            return token;
+        }
+
+        public bool offSegmentShown(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return false;
+            if (!_segmentHandlers.TryGetValue(token, out var callback)) return false;
+
+            var ok = AIChatBridge.TryUnsubscribeSegmentShown(callback, out var error);
+            if (!ok)
+            {
+                _logger.LogWarning($"[AIChatApi] unsubscribe SegmentShown failed: {error}");
+                return false;
+            }
+
+            _segmentHandlers.Remove(token);
+            return true;
+        }
+
+        public string lastSegmentSubtitle()
+        {
+            return AIChatBridge.GetLastSegmentSubtitle();
+        }
         private static string ToResult(bool ok, string error)
         {
             var payload = new Dictionary<string, object>

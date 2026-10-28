@@ -10,6 +10,8 @@ namespace ChillPatcher.Integration
         private const string AiChatGuid = "com.username.chillaimod";
         private static readonly Dictionary<Action<Dictionary<string, string>>, Delegate> EventHandlers =
             new Dictionary<Action<Dictionary<string, string>>, Delegate>();
+        private static readonly Dictionary<Action<string>, Delegate> SegmentHandlers =
+            new Dictionary<Action<string>, Delegate>();
 
         public static bool IsAvailable => GetAiChatInstance() != null;
 
@@ -285,12 +287,110 @@ namespace ChillPatcher.Integration
             }
         }
 
+        public static bool TrySubscribeSegmentShown(Action<string> onSegment, out string error)
+        {
+            error = string.Empty;
+            if (onSegment == null)
+            {
+                error = "callback is null";
+                return false;
+            }
+
+            var instance = GetAiChatInstance();
+            if (instance == null)
+            {
+                error = "AIChat not installed";
+                return false;
+            }
+
+            try
+            {
+                var eventInfo = instance.GetType().GetEvent("SegmentShown", BindingFlags.Instance | BindingFlags.Public);
+                if (eventInfo == null)
+                {
+                    error = "event not found: SegmentShown";
+                    return false;
+                }
+
+                var proxy = new SegmentShownProxy(onSegment);
+                var handler = Delegate.CreateDelegate(eventInfo.EventHandlerType, proxy, proxy.GetType().GetMethod(nameof(SegmentShownProxy.Handle)));
+                eventInfo.AddEventHandler(instance, handler);
+                SegmentHandlers[onSegment] = handler;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        public static bool TryUnsubscribeSegmentShown(Action<string> onSegment, out string error)
+        {
+            error = string.Empty;
+            if (onSegment == null)
+            {
+                error = "callback is null";
+                return false;
+            }
+
+            var instance = GetAiChatInstance();
+            if (instance == null)
+            {
+                error = "AIChat not installed";
+                return false;
+            }
+
+            if (!SegmentHandlers.TryGetValue(onSegment, out var handler))
+            {
+                error = "callback not subscribed";
+                return false;
+            }
+
+            try
+            {
+                var eventInfo = instance.GetType().GetEvent("SegmentShown", BindingFlags.Instance | BindingFlags.Public);
+                if (eventInfo == null)
+                {
+                    error = "event not found: SegmentShown";
+                    return false;
+                }
+
+                eventInfo.RemoveEventHandler(instance, handler);
+                SegmentHandlers.Remove(onSegment);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private sealed class SegmentShownProxy
+        {
+            private readonly Action<string> _callback;
+
+            public SegmentShownProxy(Action<string> callback)
+            {
+                _callback = callback;
+            }
+
+            public void Handle(string text)
+            {
+                try { _callback?.Invoke(text ?? string.Empty); } catch { }
+            }
+        }
         private static object GetAiChatInstance()
         {
             if (!Chainloader.PluginInfos.TryGetValue(AiChatGuid, out var pluginInfo)) return null;
             return pluginInfo?.Instance;
         }
 
+        public static string GetLastSegmentSubtitle()
+        {
+            return GetStringProperty("LastSegmentSubtitle");
+        }
         private static string GetStringProperty(string propertyName)
         {
             var instance = GetAiChatInstance();

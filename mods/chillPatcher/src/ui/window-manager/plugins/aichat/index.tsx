@@ -267,6 +267,7 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const [vu,setVu] = useState(0)
 
   const followRef = useRef(true)
+  const segCountRef = useRef(0)
   const dragRef = useRef({ active:false, startY:0, startScroll:0 })
 
   const maxScroll = Math.max(0, contentH - viewH)
@@ -316,8 +317,20 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
     defs.AvatarUser = ""
     setDraft(cfg)
     setDefaults(defs)
+    // 逐句推送：角色念到哪一句，气泡就出现在哪一句
+    const tSeg = typeof chill.aichat.onSegmentShown === "function"
+      ? chill.aichat.onSegmentShown((text:string)=>{
+          const zh = String(text || "").trim()
+          if (!zh) return
+          segCountRef.current++
+          appendMsgs([{ id: Date.now(), role: "ai" as const, text: zh }])
+        })
+      : ""
+
     const t = chill.aichat.onConversationCompleted((json:string)=>{
       try {
+        // 已经逐句推过了就不再补一个大气泡
+        if (segCountRef.current > 0) { segCountRef.current = 0; return }
         const d = JSON.parse(json || "{}")
         const zh = String(d.SubtitleText || "").trim()
         if (!zh) return
@@ -327,7 +340,10 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
         appendMsgs(parts.map((p, i) => ({ id: now + i, role: "ai" as const, text: p })))
       } catch (_) {}
     })
-    return ()=>{ if (t) chill.aichat.offConversationCompleted(t) }
+    return ()=>{
+      if (t) chill.aichat.offConversationCompleted(t)
+      if (tSeg && typeof chill.aichat.offSegmentShown === "function") chill.aichat.offSegmentShown(tSeg)
+    }
   },[])
 
   // 新内容进来时，若本来就在底部，就继续贴底
@@ -342,6 +358,7 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
     if (!text.trim()) return
     const r = call("startTextConversation",text,"wm-plugin")
     if (r.ok) {
+      segCountRef.current = 0
       appendMsgs([{ id: Date.now(), role: "user", text: text.trim() }])
       if (ve) {
         if (ve.SetValueWithoutNotify) ve.SetValueWithoutNotify("")
