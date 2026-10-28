@@ -459,10 +459,10 @@ namespace ChillPatcher
             AutoDiaryMaxChars = config.Bind(
                 "AutoDiary",
                 "AutoDiaryMaxChars",
-                500,
+                1500,
                 new ConfigDescription(
-                    "单篇日记的最大字数（超出时按句子截断）",
-                    new AcceptableValueRange<int>(100, 3000)
+                    "单篇日记的最大字数（超出时按句子截断）\n续写模式下至少按 2500 字处理，避免旧段落被挤掉",
+                    new AcceptableValueRange<int>(200, 8000)
                 )
             );
 

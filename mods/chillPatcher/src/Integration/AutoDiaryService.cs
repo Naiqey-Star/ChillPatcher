@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using BepInEx.Logging;
 using Bulbul;
@@ -556,7 +557,7 @@ namespace ChillPatcher.Integration
                        "3) 新しい会話は時系列に沿って自然な位置に統合し、同じ内容を繰り返さない " +
                        "4) 事実が食い違う場合だけ、その一文を新しい内容に合わせて直す " +
                        "5) 実際にあった会話と気持ちだけを書き、出来事を創作しない " +
-                       $"6) 2〜4段落、全体で {maxChars} 字以内。長すぎる場合は修飾を削り、出来事は削らない " +
+                       $"6) その日の出来事を残すことを最優先。長さは {maxChars} 字前後を目安の上限とし、削るくらいなら長くてよい " +
                        "7) 「会話ログ」「ユーザー」「AI」などの語や日付見出しを書かない、Markdown を使わない。" +
                        "日記本文だけを出力してください。";
             }
@@ -571,7 +572,7 @@ namespace ChillPatcher.Integration
                        "2) echo RECENT DAYS only when a topic, promise or feeling genuinely carries over; " +
                        "3) merge the new chat chronologically and do not repeat content; " +
                        "4) only when facts conflict, rewrite that single sentence; " +
-                       $"5) invent nothing; 6) 2-4 paragraphs, at most {maxChars} characters - compress wording first, never delete events; " +
+                       $"5) invent nothing; 6) keeping the day's events matters more than brevity: treat about {maxChars} characters as a soft ceiling and prefer writing longer over dropping events or details; " +
                        "7) never mention 'chat log', 'user', 'AI', never add a date heading, no Markdown. " +
                        "Output only the diary body.";
             }
@@ -585,7 +586,7 @@ namespace ChillPatcher.Integration
                    "3) 新对话按时间顺序并入恰当的位置，不要重复已经写过的内容；" +
                    "4) 只有新旧内容冲突时，才改冲突的那一句；" +
                    "5) 只写真实发生的对话与情绪，不编造事件；" +
-                   $"6) 2～4 个自然段，全文不超过 {maxChars} 字；篇幅紧张时先压缩修饰，不要删掉事件；" +
+                   $"6) 优先完整记录当天发生的事；以 {maxChars} 字左右为宽松上限，宁可写长一些，也不要删事件、合并细节或省略情绪；" +
                    "7) 不要出现“对话记录”“用户”“AI”“助手”等字样，不要写日期标题，不要使用 Markdown。" +
                    "只输出日记正文。";
         }
@@ -1034,10 +1035,23 @@ namespace ChillPatcher.Integration
             return s.Trim();
         }
 
+/// <summary>
+        /// 去掉模型泄漏到正文里的思考块：&lt;think&gt;…&lt;/think&gt;、&lt;thinking&gt;…&lt;/thinking&gt;，
+        /// 以及未闭合或多出来的单个标记。
+        /// </summary>
+        private static string StripReasoning(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            string s = Regex.Replace(text, @"<\s*(?:think|thinking|reasoning)\b[^>]*>[\s\S]*?<\s*/\s*(?:think|thinking|reasoning)\s*>", "", RegexOptions.IgnoreCase);
+            s = Regex.Replace(s, @"<\s*/?\s*(?:think|thinking|reasoning)\b[^>]*>", "", RegexOptions.IgnoreCase);
+            return s.Trim();
+        }
+
         private static string NormalizeDiaryText(string raw, int maxChars)
         {
             if (string.IsNullOrWhiteSpace(raw)) return "";
             string s = raw.Replace("\r\n", "\n").Replace("\r", "\n").Trim();
+            s = StripReasoning(s);
 
             // 去掉 Markdown 代码块与标题符号
             if (s.StartsWith("```"))
@@ -1083,10 +1097,11 @@ namespace ChillPatcher.Integration
         private static int GetMaxChars()
         {
             var cfg = PluginConfig.AutoDiaryMaxChars;
-            int configured = cfg == null ? 500 : Math.Max(100, Math.Min(3000, cfg.Value));
+            int configured = cfg == null ? 1500 : Math.Max(200, Math.Min(8000, cfg.Value));
             bool incremental = PluginConfig.AutoDiaryIncremental == null || PluginConfig.AutoDiaryIncremental.Value;
             // 续写模式下日记会越来越长，给一个下限，避免第一版默认的 500 字把旧内容挤掉
-            return incremental ? Math.Max(configured, 1000) : configured;
+            // 续写模式下旧内容只会越积越多，下限给高一些，避免默认值把已有段落挤掉
+            return incremental ? Math.Max(configured, 2500) : configured;
         }
 
         private static string Clip(string s, int max)
