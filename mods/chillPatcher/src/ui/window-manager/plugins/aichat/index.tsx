@@ -12,6 +12,7 @@ try {
 
 type KV = Record<string, string>
 const groups: Record<string, string[]> = {
+  "0. 后端": ["UseDshBridge","DshBridgeUrl","DshBridgeToken","DshBridgeModel"],
   "1. LLM": ["Use_Ollama_API","ThinkMode","API_URL","API_Key","ModelName","LogApiRequestBody","FixApiPathForThinkMode"],
   "2. TTS": ["TTS_Service_URL","TTS_Service_Script_Path","LaunchTTSService","QuitTTSServiceOnQuit","Audio_File_Path","AudioPathCheck","Audio_File_Text","PromptLang","TargetLang","JapaneseCheck","VoiceVolume"],
   "3. UI": ["WindowWidth","WindowHeightBase","ReverseEnterBehavior","BackgroundOpacity","ShowWindowTitle"],
