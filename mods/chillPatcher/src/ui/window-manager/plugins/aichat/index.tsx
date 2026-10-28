@@ -16,7 +16,7 @@ const groups: Record<string, string[]> = {
   "2. TTS": ["TTS_Service_URL","TTS_Service_Script_Path","LaunchTTSService","QuitTTSServiceOnQuit","Audio_File_Path","AudioPathCheck","Audio_File_Text","PromptLang","TargetLang","JapaneseCheck","VoiceVolume"],
   "3. UI": ["WindowWidth","WindowHeightBase","ReverseEnterBehavior","BackgroundOpacity","ShowWindowTitle"],
   "4. Persona": ["ExperimentalMemory","SystemPrompt"],
-  "5. 头像": ["AvatarAI","AvatarUser"],
+  "5. Avatar": ["AvatarAI","AvatarUser"],
 }
 const multilineKeys = new Set(["Audio_File_Text", "SystemPrompt"])
 
@@ -47,7 +47,7 @@ const paginateFields = (fields:string[], maxHeight:number) => {
   return pages.length > 0 ? pages : [[]]
 }
 
-const SavePanel = ({draft,defaults,setDraft,onCancel,onOk}:{draft:KV;defaults:KV;setDraft:(v:KV)=>void;onCancel:()=>void;onOk:()=>void}) => {
+const SavePanel = ({draft,defaults,setDraft,onCancel,onOk,status}:{draft:KV;defaults:KV;setDraft:(v:KV)=>void;onCancel:()=>void;onOk:()=>void;status?:any}) => {
   const pages = Object.keys(groups)
   const [page,setPage] = useState(0)
   const [contentPage,setContentPage] = useState(0)
@@ -87,17 +87,20 @@ const SavePanel = ({draft,defaults,setDraft,onCancel,onOk}:{draft:KV;defaults:KV
   )
 
   return <div style={{flexGrow:1,height:"100%",display:"Flex",flexDirection:"Column",backgroundColor:"transparent",padding:10,overflow:"Hidden"}}>
-    <div style={{fontSize:13,color:"#e2e8f0",marginBottom:8,flexShrink:0}}>AIChat 配置</div>
+    <div style={{fontSize:13,color:"#e2e8f0",marginBottom:2,flexShrink:0}}>AIChat 配置</div>
+    <div style={{fontSize:9,color:"#64748b",marginBottom:8,flexShrink:0,whiteSpace:"Normal"}}>
+      {status?.available ? "已连接" : "未安装"}　busy: {String(!!status?.isBusy)}　ready: {String(!!status?.isReady)}　ver: {status?.apiVersion || "-"}
+    </div>
 
     <div style={{display:"Flex",flexDirection:"Row",marginBottom:8,flexShrink:0}}>
-      {pages.map((g,idx)=><div key={g} onPointerDown={()=>{ setPage(idx); setContentPage(0) }} style={{fontSize:10,color:idx===page?"#0f172a":"#cbd5e1",backgroundColor:idx===page?"#93c5fd":"#1e293b",paddingLeft:8,paddingRight:8,paddingTop:5,paddingBottom:5,borderRadius:6,marginRight:6}}>{g.replace("1. ","").replace("2. ","").replace("3. ","").replace("4. ","")}</div>)}
+      {pages.map((g,idx)=><div key={g} onPointerDown={()=>{ setPage(idx); setContentPage(0) }} style={{fontSize:10,color:idx===page?"#0f172a":"#cbd5e1",backgroundColor:idx===page?"#93c5fd":"#1e293b",paddingLeft:8,paddingRight:8,paddingTop:5,paddingBottom:5,borderRadius:6,marginRight:6}}>{g.replace(/^\d+\.\s*/, "")}</div>)}
     </div>
 
     <div style={{fontSize:11,color:"#93c5fd",marginBottom:6,flexShrink:0}}>{currentGroup}</div>
     <div style={{flexGrow:1,flexShrink:1,minHeight:120,backgroundColor:"#0b122099",borderWidth:1,borderColor:"#1f2937",borderRadius:6,padding:6,overflow:"Hidden"}}
       onGeometryChanged={(e:any)=>setContentHeight(Math.max(120, Math.floor(e?.newRect?.height ?? e?.target?.layout?.height ?? 220)))}>
       {displayFields.map(row)}
-      {currentGroup === "4. Persona" && <div style={{fontSize:9,color:"#64748b",marginTop:4,flexShrink:0}}>SystemPrompt 建议手动粘贴完整内容后再点击确定保存。</div>}      {currentGroup === "5. 头像" && <div style={{display:"Flex",flexDirection:"Column",marginTop:6,flexShrink:0}}>
+      {currentGroup === "4. Persona" && <div style={{fontSize:9,color:"#64748b",marginTop:4,flexShrink:0}}>SystemPrompt 建议手动粘贴完整内容后再点击确定保存。</div>}      {currentGroup === "5. Avatar" && <div style={{display:"Flex",flexDirection:"Column",marginTop:6,flexShrink:0}}>
         <div style={{display:"Flex",flexDirection:"Row",alignItems:"Center",marginBottom:6}}>
           <Avatar role="ai" size={44} path={String(draft["AvatarAI"] ?? "")} />
           <div style={{marginLeft:10,fontSize:9,color:"#64748b",whiteSpace:"Normal"}}>角色头像预览（AI）</div>
@@ -421,16 +424,13 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const thumbH = maxScroll > 0 ? Math.max(22, Math.round(viewH * Math.min(1, viewH / Math.max(contentH, 1)))) : 0
   const thumbTop = maxScroll > 0 ? Math.round((clampY(scrollY) / maxScroll) * Math.max(0, viewH - thumbH)) : 0
 
-  if (cfgMode && !compact) return <SavePanel draft={draft} defaults={defaults} setDraft={setDraft} onCancel={()=>setCfgMode(false)} onOk={save} />
+  if (cfgMode && !compact) return <SavePanel draft={draft} defaults={defaults} setDraft={setDraft} onCancel={()=>setCfgMode(false)} onOk={save} status={status} />
 
   return <div
     onGeometryChanged={(e:any)=>{ const rr = e?.newRect; if (rr) { if (rr.width) setPanelW(Math.max(220, Math.floor(rr.width))); if (rr.height) setPanelH(Math.max(160, Math.floor(rr.height))) } }}
     style={{flexGrow:1,display:"Flex",flexDirection:"Column",backgroundColor:"transparent",padding:10,overflow:"Hidden"}}>
 
-    {!compact && <>
-      <div style={{fontSize:11,color:status.available?"#86efac":"#fca5a5",marginBottom:2,flexShrink:0}}>{status.available?"AIChat 已连接":"AIChat 未安装"}</div>
-      <div style={{fontSize:10,color:"#94a3b8",marginBottom:6,flexShrink:0}}>busy:{String(!!status.isBusy)} ready:{String(!!status.isReady)} ver:{status.apiVersion || "-"}</div>
-    </>}
+    {!compact && !status.available && <div style={{fontSize:11,color:"#fca5a5",marginBottom:6,flexShrink:0}}>AIChat 未安装</div>}
 
     {!compact && <div
       onGeometryChanged={(e:any)=>{ const hh = e?.newRect?.height; if (hh) setViewH(Math.max(1, Math.floor(hh))) }}
