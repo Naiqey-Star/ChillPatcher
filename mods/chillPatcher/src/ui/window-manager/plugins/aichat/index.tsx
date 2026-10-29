@@ -265,6 +265,9 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const [viewH,setViewH] = useState(0)
   const [contentH,setContentH] = useState(0)
   const [scrollY,setScrollY] = useState(0)
+  // 气泡高度缓存：只渲染视口附近的消息，未渲染的用平均高度占位
+  const heightsRef = useRef<Map<number, number>>(new Map())
+  const [renderRev, setRenderRev] = useState(0)
   const [dragging,setDragging] = useState(false)
   const [vu,setVu] = useState(0)
 
@@ -460,12 +463,23 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const availW = Math.max(140, panelW - 26)
   const sendW = Math.min(64, Math.max(46, Math.round(availW * 0.15)))
   const textW = Math.max(80, availW - sendW - 8)
-  const lineCount = useMemo(()=>{
-    const src = prompt.length > 0 ? prompt : " "
-    let n = 0
-    for (const part of src.split("\n")) n += Math.max(1, Math.ceil((part.length * 13) / Math.max(40, textW)))
-    return Math.max(1, n)
-  },[prompt, textW])
+  // 文字实际宽度估算：中日韩字符约 1.05em，ASCII 约 0.55em；再扣掉输入框左右内边距。
+  // 之前按“每个字符 13px”算，中文行会少算一行，导致自动换行时高度和光标跟随都不动。
+  const usableTextW = Math.max(40, textW - 18)
+  const measurePx = (s:string) => {
+    let w = 0
+    for (const ch of s) {
+      const cp = ch.codePointAt(0) ?? 0
+      w += cp > 0x2e80 ? 12.6 : 6.7
+    }
+    return w
+  }
+  const wrapRows = (s:string) => {
+    let rows = 0
+    for (const part of s.split("\n")) rows += Math.max(1, Math.ceil(measurePx(part) / usableTextW))
+    return Math.max(1, rows)
+  }
+  const lineCount = useMemo(()=>wrapRows(prompt.length > 0 ? prompt : " "),[prompt, usableTextW])
   const caretIndex = (() => {
     try {
       const ve = fieldRef.current?.ve ?? fieldRef.current
@@ -473,8 +487,8 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
       return typeof c === "number" && c >= 0 ? c : prompt.length
     } catch (_) { return prompt.length }
   })()
-  const perLine = Math.max(6, Math.floor(textW / 13))
-  const caretRow = wrappedRowAt(prompt, caretIndex, perLine)
+  // 光标所在行（0 起）：按光标前的文本宽度折行，而不是按“字符数/固定行宽”估算
+  const caretRow = Math.max(0, wrapRows(prompt.slice(0, Math.max(0, caretIndex))) - 1)
   const lineH = 17
   const fullInputH = Math.max(32, 12 + lineCount * lineH)
   const inputMaxH = compact ? 64 : Math.max(70, Math.min(190, Math.round(panelH * 0.34)))
@@ -482,7 +496,47 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const inputOverflow = Math.max(0, fullInputH - inputH)
   const inputScroll = Math.max(0, Math.min(inputOverflow, caretRow * lineH + 6 - (inputH - lineH - 6)))
 
-  const thumbH = maxScroll > 0 ? Math.max(22, Math.round(viewH * Math.min(1, viewH / Math.max(contentH, 1)))) : 0
+  // ---- 虚拟列表：按滚动位置只渲染可见范围 ----
+  const RENDER_OVERSCAN = 200
+  const heightOf = (id:number) => heightsRef.current.get(id) ?? 58
+  const bubbleLayout = useMemo(()=>{
+    const out: number[] = new Array(msgs.length)
+    let acc = 0
+    for (let i = 0; i < msgs.length; i++) {
+      out[i] = acc
+      acc += heightOf(msgs[i].id)
+    }
+    return { offsets: out, total: acc }
+  },[msgs, renderRev])
+
+  const visibleRange = useMemo(()=>{
+    const len = msgs.length
+    if (len === 0) return { first: 0, last: -1, top: 0, bottom: 0 }
+    const y0 = clampY(scrollY) - RENDER_OVERSCAN
+    const y1 = clampY(scrollY) + Math.max(viewH, 60) + RENDER_OVERSCAN
+    let first = 0
+    while (first < len - 1 && bubbleLayout.offsets[first] + heightOf(msgs[first].id) < y0) first++
+    let last = first
+    while (last < len - 1 && bubbleLayout.offsets[last] < y1) last++
+    const endOffset = bubbleLayout.offsets[last] + heightOf(msgs[last].id)
+    return {
+      first,
+      last,
+      top: bubbleLayout.offsets[first],
+      bottom: Math.max(0, bubbleLayout.total - endOffset),
+    }
+  },[msgs, renderRev, scrollY, viewH, bubbleLayout])
+
+  const measureBubble = (id:number, h:number) => {
+    if (!(h > 0)) return
+    const prev = heightsRef.current.get(id)
+    if (prev !== undefined && Math.abs(prev - h) < 0.5) return
+    heightsRef.current.set(id, h)
+    setRenderRev(v => v + 1)
+  }
+
+  const thumbH = maxScroll > 0
+ ? Math.max(22, Math.round(viewH * Math.min(1, viewH / Math.max(contentH, 1)))) : 0
   const thumbTop = maxScroll > 0 ? Math.round((clampY(scrollY) / maxScroll) * Math.max(0, viewH - thumbH)) : 0
 
   if (cfgMode && !compact) return <SavePanel draft={draft} defaults={defaults} setDraft={setDraft} onCancel={()=>setCfgMode(false)} onOk={save} status={status} />
@@ -501,7 +555,13 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
         onGeometryChanged={(e:any)=>{ const hh = e?.newRect?.height; if (hh) setContentH(Math.max(1, Math.floor(hh))) }}
         style={{position:"Absolute",left:0,right:0,top:0,display:"Flex",flexDirection:"Column",translate:`0 ${-Math.round(clampY(scrollY))}px`}}>
         {msgs.length === 0 ? <div style={{fontSize:11,color:"#94a3b8"}}>（还没有对话）</div> : null}
-        {msgs.map(m => <Bubble key={m.id} m={m} maxW={Math.max(120, Math.round(panelW * 0.6))} avatar={26} aiPath={aiAvatarPath} userPath={userAvatarPath} />)}
+{visibleRange.top > 0 ? <div style={{height: Math.round(visibleRange.top)}} /> : null}
+        {visibleRange.last >= visibleRange.first && msgs.slice(visibleRange.first, visibleRange.last + 1).map(m => (
+          <div key={m.id} onGeometryChanged={(e:any)=>{ const hh = e?.newRect?.height; if (hh) measureBubble(m.id, hh) }}>
+            <Bubble m={m} maxW={Math.max(120, Math.round(panelW * 0.6))} avatar={26} aiPath={aiAvatarPath} userPath={userAvatarPath} />
+          </div>
+        ))}
+        {visibleRange.bottom > 0 ? <div style={{height: Math.round(visibleRange.bottom)}} /> : null}
       </div>
 
       <div onPointerDown={onScrubDown} style={{position:"Absolute",left:0,top:0,right:0,bottom:0}} />
