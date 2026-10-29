@@ -527,10 +527,12 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
     }
   },[msgs, renderRev, scrollY, viewH, bubbleLayout])
 
-  const measureBubble = (id:number, h:number) => {
-    if (!(h > 0)) return
+  const measureBubble = (id:number, raw:number) => {
+    if (!(raw > 0)) return
+    // 取整后比较，避免亚像素抖动导致 measure -> render -> measure 的循环
+    const h = Math.round(raw)
     const prev = heightsRef.current.get(id)
-    if (prev !== undefined && Math.abs(prev - h) < 0.5) return
+    if (prev === h) return
     heightsRef.current.set(id, h)
     setRenderRev(v => v + 1)
   }

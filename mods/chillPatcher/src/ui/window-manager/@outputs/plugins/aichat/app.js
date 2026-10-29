@@ -546,11 +546,12 @@
         bottom: Math.max(0, bubbleLayout.total - endOffset)
       };
     }, [msgs, renderRev, scrollY, viewH, bubbleLayout]);
-    const measureBubble = (id, h2) => {
-      if (!(h2 > 0))
+    const measureBubble = (id, raw) => {
+      if (!(raw > 0))
         return;
+      const h2 = Math.round(raw);
       const prev = heightsRef.current.get(id);
-      if (prev !== void 0 && Math.abs(prev - h2) < 0.5)
+      if (prev === h2)
         return;
       heightsRef.current.set(id, h2);
       setRenderRev((v) => v + 1);
