@@ -265,9 +265,6 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const [viewH,setViewH] = useState(0)
   const [contentH,setContentH] = useState(0)
   const [scrollY,setScrollY] = useState(0)
-  // 气泡高度缓存：只渲染视口附近的消息，未渲染的用平均高度占位
-  const heightsRef = useRef<Map<number, number>>(new Map())
-  const [renderRev, setRenderRev] = useState(0)
   const [dragging,setDragging] = useState(false)
   const [vu,setVu] = useState(0)
 
@@ -496,47 +493,23 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
   const inputOverflow = Math.max(0, fullInputH - inputH)
   const inputScroll = Math.max(0, Math.min(inputOverflow, caretRow * lineH + 6 - (inputH - lineH - 6)))
 
-  // ---- 虚拟列表：按滚动位置只渲染可见范围 ----
-  const RENDER_OVERSCAN = 200
-  const heightOf = (id:number) => heightsRef.current.get(id) ?? 58
-  const bubbleLayout = useMemo(()=>{
-    const out: number[] = new Array(msgs.length)
-    let acc = 0
-    for (let i = 0; i < msgs.length; i++) {
-      out[i] = acc
-      acc += heightOf(msgs[i].id)
-    }
-    return { offsets: out, total: acc }
-  },[msgs, renderRev])
-
-  const visibleRange = useMemo(()=>{
-    const len = msgs.length
-    if (len === 0) return { first: 0, last: -1, top: 0, bottom: 0 }
-    const y0 = clampY(scrollY) - RENDER_OVERSCAN
-    const y1 = clampY(scrollY) + Math.max(viewH, 60) + RENDER_OVERSCAN
-    let first = 0
-    while (first < len - 1 && bubbleLayout.offsets[first] + heightOf(msgs[first].id) < y0) first++
-    let last = first
-    while (last < len - 1 && bubbleLayout.offsets[last] < y1) last++
-    const endOffset = bubbleLayout.offsets[last] + heightOf(msgs[last].id)
-    return {
-      first,
-      last,
-      top: bubbleLayout.offsets[first],
-      bottom: Math.max(0, bubbleLayout.total - endOffset),
-    }
-  },[msgs, renderRev, scrollY, viewH, bubbleLayout])
-
-  const measureBubble = (id:number, raw:number) => {
-    if (!(raw > 0)) return
-    // 取整后比较，避免亚像素抖动导致 measure -> render -> measure 的循环
-    const h = Math.round(raw)
-    const prev = heightsRef.current.get(id)
-    if (prev === h) return
-    heightsRef.current.set(id, h)
-    setRenderRev(v => v + 1)
+  // ---- 只渲染最近的一段；点「更早」以 20 条为单位向前扩张 ----
+  const [renderWindow, setRenderWindow] = useState(20)
+  const windowStart = Math.max(0, msgs.length - renderWindow)
+  const shownMsgs = msgs.slice(windowStart)
+  const expandAnchorRef = useRef<number|null>(null)
+  const expandOlder = () => {
+    if (windowStart <= 0) return
+    expandAnchorRef.current = contentH
+    setRenderWindow(n => n + 20)
   }
-
+  useEffect(()=>{
+    const prev = expandAnchorRef.current
+    if (prev === null) return
+    expandAnchorRef.current = null
+    // 向上补内容后把滚动位置同步推下去，视线不会跳
+    setScrollY(y => clampY(y + Math.max(0, contentH - prev)))
+  },[contentH])
   const thumbH = maxScroll > 0
  ? Math.max(22, Math.round(viewH * Math.min(1, viewH / Math.max(contentH, 1)))) : 0
   const thumbTop = maxScroll > 0 ? Math.round((clampY(scrollY) / maxScroll) * Math.max(0, viewH - thumbH)) : 0
@@ -557,13 +530,8 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
         onGeometryChanged={(e:any)=>{ const hh = e?.newRect?.height; if (hh) setContentH(Math.max(1, Math.floor(hh))) }}
         style={{position:"Absolute",left:0,right:0,top:0,display:"Flex",flexDirection:"Column",translate:`0 ${-Math.round(clampY(scrollY))}px`}}>
         {msgs.length === 0 ? <div style={{fontSize:11,color:"#94a3b8"}}>（还没有对话）</div> : null}
-{visibleRange.top > 0 ? <div style={{height: Math.round(visibleRange.top)}} /> : null}
-        {visibleRange.last >= visibleRange.first && msgs.slice(visibleRange.first, visibleRange.last + 1).map(m => (
-          <div key={m.id} onGeometryChanged={(e:any)=>{ const hh = e?.newRect?.height; if (hh) measureBubble(m.id, hh) }}>
-            <Bubble m={m} maxW={Math.max(120, Math.round(panelW * 0.6))} avatar={26} aiPath={aiAvatarPath} userPath={userAvatarPath} />
-          </div>
-        ))}
-        {visibleRange.bottom > 0 ? <div style={{height: Math.round(visibleRange.bottom)}} /> : null}
+        {windowStart > 0 ? <div onPointerDown={expandOlder} style={{alignSelf:"Center",marginBottom:6,paddingLeft:10,paddingRight:10,paddingTop:4,paddingBottom:4,borderRadius:10,backgroundColor:"#334155cc",fontSize:10,color:"#cbd5e1"}}>{`↑ 更早的 20 条（还有 ${windowStart} 条）`}</div> : null}
+        {shownMsgs.map(m => <Bubble key={m.id} m={m} maxW={Math.max(120, Math.round(panelW * 0.6))} avatar={26} aiPath={aiAvatarPath} userPath={userAvatarPath} />)}
       </div>
 
       <div onPointerDown={onScrubDown} style={{position:"Absolute",left:0,top:0,right:0,bottom:0}} />
