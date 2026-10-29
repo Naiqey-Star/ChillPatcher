@@ -530,11 +530,13 @@ const ChatPanel = ({compact=false}:{compact?:boolean}) => {
         onGeometryChanged={(e:any)=>{ const hh = e?.newRect?.height; if (hh) setContentH(Math.max(1, Math.floor(hh))) }}
         style={{position:"Absolute",left:0,right:0,top:0,display:"Flex",flexDirection:"Column",translate:`0 ${-Math.round(clampY(scrollY))}px`}}>
         {msgs.length === 0 ? <div style={{fontSize:11,color:"#94a3b8"}}>（还没有对话）</div> : null}
-        {windowStart > 0 ? <div onPointerDown={expandOlder} style={{alignSelf:"Center",marginBottom:6,paddingLeft:10,paddingRight:10,paddingTop:4,paddingBottom:4,borderRadius:10,backgroundColor:"#334155cc",fontSize:10,color:"#cbd5e1"}}>{`↑ 更早的 20 条（还有 ${windowStart} 条）`}</div> : null}
         {shownMsgs.map(m => <Bubble key={m.id} m={m} maxW={Math.max(120, Math.round(panelW * 0.6))} avatar={26} aiPath={aiAvatarPath} userPath={userAvatarPath} />)}
       </div>
 
       <div onPointerDown={onScrubDown} style={{position:"Absolute",left:0,top:0,right:0,bottom:0}} />
+
+      {windowStart > 0 ? <div onPointerDown={(e:any)=>{ if (e?.StopPropagation) e.StopPropagation(); expandOlder() }}
+        style={{position:"Absolute",left:10,top:34,paddingLeft:10,paddingRight:10,paddingTop:4,paddingBottom:4,borderRadius:10,backgroundColor:"#0f172ad9",borderWidth:1,borderColor:"#475569",fontSize:10,color:"#cbd5e1"}}>{`↑ 更早的 20 条（还有 ${windowStart} 条）`}</div> : null}
 
       {maxScroll > 0 ? <div style={{position:"Absolute",right:0,top:0,width:8,height:"100%",backgroundColor:"#ffffff12",borderRadius:4}}>
         <div onPointerDown={onScrubDown}

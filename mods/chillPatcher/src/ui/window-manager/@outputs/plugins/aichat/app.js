@@ -570,10 +570,21 @@
             style: { position: "Absolute", left: 0, right: 0, top: 0, display: "Flex", flexDirection: "Column", translate: `0 ${-Math.round(clampY(scrollY))}px` }
           },
           msgs.length === 0 ? /* @__PURE__ */ h("div", { style: { fontSize: 11, color: "#94a3b8" } }, "\uFF08\u8FD8\u6CA1\u6709\u5BF9\u8BDD\uFF09") : null,
-          windowStart > 0 ? /* @__PURE__ */ h("div", { onPointerDown: expandOlder, style: { alignSelf: "Center", marginBottom: 6, paddingLeft: 10, paddingRight: 10, paddingTop: 4, paddingBottom: 4, borderRadius: 10, backgroundColor: "#334155cc", fontSize: 10, color: "#cbd5e1" } }, `\u2191 \u66F4\u65E9\u7684 20 \u6761\uFF08\u8FD8\u6709 ${windowStart} \u6761\uFF09`) : null,
           shownMsgs.map((m) => /* @__PURE__ */ h(Bubble, { key: m.id, m, maxW: Math.max(120, Math.round(panelW * 0.6)), avatar: 26, aiPath: aiAvatarPath, userPath: userAvatarPath }))
         ),
         /* @__PURE__ */ h("div", { onPointerDown: onScrubDown, style: { position: "Absolute", left: 0, top: 0, right: 0, bottom: 0 } }),
+        windowStart > 0 ? /* @__PURE__ */ h(
+          "div",
+          {
+            onPointerDown: (e) => {
+              if (e?.StopPropagation)
+                e.StopPropagation();
+              expandOlder();
+            },
+            style: { position: "Absolute", left: 10, top: 34, paddingLeft: 10, paddingRight: 10, paddingTop: 4, paddingBottom: 4, borderRadius: 10, backgroundColor: "#0f172ad9", borderWidth: 1, borderColor: "#475569", fontSize: 10, color: "#cbd5e1" }
+          },
+          `\u2191 \u66F4\u65E9\u7684 20 \u6761\uFF08\u8FD8\u6709 ${windowStart} \u6761\uFF09`
+        ) : null,
         maxScroll > 0 ? /* @__PURE__ */ h("div", { style: { position: "Absolute", right: 0, top: 0, width: 8, height: "100%", backgroundColor: "#ffffff12", borderRadius: 4 } }, /* @__PURE__ */ h(
           "div",
           {
