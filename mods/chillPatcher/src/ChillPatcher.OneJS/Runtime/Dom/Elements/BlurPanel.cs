@@ -171,12 +171,21 @@ namespace OneJS.Dom
             if (!_attached) return;
 
             int frame = Time.frameCount;
-            if (frame - _lastUpdateFrame < _frameInterval) return;
-            _lastUpdateFrame = frame;
 
             var rect = worldBound;
             if (float.IsNaN(rect.width) || float.IsNaN(rect.height)) return;
             if (rect.width < 2f || rect.height < 2f) return;
+
+            // 模糊的成本大致和面板面积成正比：一次更新要重渲染整个场景，再做十几次 Blit。
+            // 大窗口按面积自动降频，避免一个聊天面板每帧重画一次世界。
+            float area = rect.width * rect.height;
+            int interval = _frameInterval;
+            if (area >= 120000f) interval = Mathf.Max(interval, 2);
+            if (area >= 260000f) interval = Mathf.Max(interval, 3);
+            if (area >= 480000f) interval = Mathf.Max(interval, 4);
+
+            if (frame - _lastUpdateFrame < interval) return;
+            _lastUpdateFrame = frame;
 
             try
             {
