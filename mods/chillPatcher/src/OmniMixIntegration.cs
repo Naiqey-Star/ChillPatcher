@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Bulbul;
@@ -260,6 +261,13 @@ namespace ChillPatcher
             catch { return false; }
         }
 
+/// <summary>
+        /// 这个平台是否能用 Unix domain socket 跟后端通信。
+        /// Windows 上的原生 SDK 不支持 AF_UNIX，残留的 .sock 文件只会让连接反复失败。
+        /// </summary>
+        private static bool SocketFallbackSupported()
+            => !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+
         /// <summary>
         /// Check if a Unix Domain Socket file exists.
         /// On Windows they are IO_REPARSE_TAG_AF_UNIX reparse points —
@@ -279,6 +287,8 @@ namespace ChillPatcher
 
         private CancellationTokenSource _connectionLoopCts;
         private bool _isConnectionLoopRunning;
+        private DateTime _nextConnectAttemptUtc = DateTime.MinValue;
+        private const int ConnectRetrySeconds = 30;
 
         private void StartConnectionLoop()
         {
@@ -310,7 +320,7 @@ namespace ChillPatcher
                     var port = ReadPortFile();
                     alive = (port.HasValue && QuickTcpProbe(port.Value))
                             || QuickTcpProbe(17890)
-                            || SocketFileExists(ResolveSocketPath());
+                            || (SocketFallbackSupported() && SocketFileExists(ResolveSocketPath()));
                 }
                 catch { }
 
@@ -324,11 +334,16 @@ namespace ChillPatcher
                 }
                 else
                 {
-                    if (!_connected)
+                    if (!_connected && DateTime.UtcNow >= _nextConnectAttemptUtc)
                     {
                         Plugin.Log?.LogInfo("[OmniMix] Backend detected, attempting to connect...");
                         bool success = await ConnectInternalAsync();
-                        if (success)
+                        if (!success)
+                        {
+                            // 后端可能是半死状态：退避一段时间再试，别每 5 秒清一次资源
+                            _nextConnectAttemptUtc = DateTime.UtcNow.AddSeconds(ConnectRetrySeconds);
+                        }
+                        else
                         {
                             Plugin.Log?.LogInfo("[OmniMix] Reconnected to backend. Syncing songs...");
                             try
@@ -376,9 +391,9 @@ namespace ChillPatcher
                     goto connect;
                 }
 
-                // Step 3: Try Unix socket fallback
+                // Step 3: Try Unix socket fallback (Windows 原生 SDK 不支持，直接跳过)
                 var socketPath = ResolveSocketPath();
-                if (SocketFileExists(socketPath))
+                if (SocketFallbackSupported() && SocketFileExists(socketPath))
                 {
                     Plugin.Log?.LogInfo("[OmniMix] Backend detected via Unix socket, connecting...");
                     _client = new OmniMixPlayerClient(socketPath, useSocket: true);
@@ -431,7 +446,15 @@ namespace ChillPatcher
             catch (Exception ex)
             {
                 Plugin.Log?.LogWarning($"[OmniMix] Failed to connect internally: {ex.Message}");
-                await DisconnectInternalAsync();
+                if (_connected)
+                {
+                    await DisconnectInternalAsync();
+                }
+                else
+                {
+                    // 从未连上过：只丢掉客户端，不清理音频缓存（那会打断正在播放的歌）
+                    _client = null;
+                }
                 return false;
             }
         }
