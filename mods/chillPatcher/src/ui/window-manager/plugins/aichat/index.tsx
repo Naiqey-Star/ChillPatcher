@@ -16,7 +16,7 @@ const groups: Record<string, string[]> = {
   "1. LLM": ["Use_Ollama_API","ThinkMode","API_URL","API_Key","ModelName","LogApiRequestBody","FixApiPathForThinkMode"],
   "2. TTS": ["TTS_Service_URL","TTS_Service_Script_Path","LaunchTTSService","QuitTTSServiceOnQuit","Audio_File_Path","AudioPathCheck","Audio_File_Text","PromptLang","TargetLang","JapaneseCheck","VoiceVolume"],
   "3. UI": ["WindowWidth","WindowHeightBase","ReverseEnterBehavior","BackgroundOpacity","ShowWindowTitle"],
-  "4. Persona": ["ExperimentalMemory","SystemPrompt"],
+  "4. Persona": ["ExperimentalMemory","SystemPrompt","ProactiveEnabled","ProactiveMinMinutes","ProactiveMaxMinutes"],
   "Avatar": ["AvatarAI","AvatarUser"],
 }
 const multilineKeys = new Set(["Audio_File_Text", "SystemPrompt"])
