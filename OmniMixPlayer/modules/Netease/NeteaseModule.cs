@@ -122,6 +122,16 @@ namespace OmniMixPlayer.Module.Netease
 
             // 信任 cookie 文件，不做额外 API 验证（避免因验证接口问题误删有效 cookie）
             _isLoggedIn = _bridge.IsLoggedIn;
+            if (_isLoggedIn)
+            {
+                // 会话可能已过期（服务端 auth 失败）：快速校验，过期就回落到二维码登录
+                var probe = new NeteaseSessionManager(_bridge, context.Logger);
+                if (!await probe.ValidateAndRefreshAsync())
+                {
+                    _isLoggedIn = false;
+                    context.Logger.LogWarning($"[{DisplayName}] 会话已过期，回落到未登录模式");
+                }
+            }
             if (!_isLoggedIn)
             {
                 context.Logger.LogWarning($"[{DisplayName}] 未登录网易云音乐，显示二维码登录");
@@ -827,6 +837,14 @@ namespace OmniMixPlayer.Module.Netease
 
         private async Task ScanAndRegisterAsync()
         {
+            // 会话未确认有效时（未登录/已过期）不要调用原生 GetLikeSongs：
+            // 原生桥接对“过期会话返回的空列表”会越界 panic，直接把后端进程带崩。
+            if (_sessionManager != null && _sessionManager.State != SessionState.LoggedIn)
+            {
+                _context.Logger.LogWarning($"[{DisplayName}] 会话未登录，跳过收藏歌曲扫描");
+                return;
+            }
+
             var songs = _bridge.GetLikeSongs(true);
             if (songs == null || songs.Count == 0)
             {

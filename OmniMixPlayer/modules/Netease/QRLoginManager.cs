@@ -1,8 +1,11 @@
-﻿using System;
+using System;
+using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json.Linq;
 using QRCoder;
 
 
@@ -12,6 +15,12 @@ namespace OmniMixPlayer.Module.Netease
     /// 二维码登录管理器
     /// 负责生成登录二维码、轮询登录状态
     /// </summary>
+    /// <remarks>
+    /// 原实现依赖原生 ChillNetease.dll 的 weapi 加密接口，该接口在网易云服务端
+    /// 调整后拿不到 unikey，导致二维码一直加载不出来。这里改为直接调用网易云的
+    /// 简单 HTTP 接口（/api/login/qrcode/*），登录成功后再把 MUSIC_U cookie 写回
+    /// 原生桥接，其余播放/收藏仍走原生逻辑。
+    /// </remarks>
     public class QRLoginManager
     {
         private readonly NeteaseBridge _bridge;
@@ -21,42 +30,23 @@ namespace OmniMixPlayer.Module.Netease
         private byte[] _qrCodeBytes;
         private bool _isPolling;
         private CancellationTokenSource _pollingCts;
+        private string _uniKey;
+        private string _pendingMusicU;
 
         private static readonly TimeSpan POLLING_TIMEOUT = TimeSpan.FromMinutes(2);
+        private static readonly HttpClient _http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
 
-        /// <summary>
-        /// 登录成功事件
-        /// </summary>
+        private const string UnikeyUrl = "https://music.163.com/api/login/qrcode/unikey?type=1";
+        private const string CheckBaseUrl = "https://music.163.com/api/login/qrcode/client/login";
+        private const string QRLoginUrlPrefix = "https://music.163.com/login?codekey=";
+
         public event Action OnLoginSuccess;
-
-        /// <summary>
-        /// 二维码更新事件 (新二维码生成时触发)
-        /// </summary>
         public event Action<byte[]> OnQRCodeUpdated;
-
-        /// <summary>
-        /// 状态变化事件
-        /// </summary>
         public event Action<string> OnStatusChanged;
-
-        /// <summary>
-        /// 登录失败/取消事件
-        /// </summary>
         public event Action<string> OnLoginFailed;
 
-        /// <summary>
-        /// 当前二维码字节数据 (用于 SMTC / UI)
-        /// </summary>
         public byte[] QRCodeBytes => _qrCodeBytes;
-
-        /// <summary>
-        /// 是否正在等待登录
-        /// </summary>
         public bool IsWaitingForLogin => _isPolling && _currentState != null;
-
-        /// <summary>
-        /// 当前状态消息
-        /// </summary>
         public string StatusMessage => _currentState?.StatusMsg ?? "未开始";
 
         public QRLoginManager(NeteaseBridge bridge, ILogger logger)
@@ -65,39 +55,37 @@ namespace OmniMixPlayer.Module.Netease
             _logger = logger;
         }
 
-        /// <summary>
-        /// 开始二维码登录流程
-        /// </summary>
         public async Task<bool> StartLoginAsync()
         {
             try
             {
-                // 取消之前的轮询
                 CancelPolling();
-
-                // 清理旧的二维码资源（每次重新开始时都清理）
                 CleanupQRCodeResources();
 
-                // 获取二维码（同步调用 Go DLL）
-                _currentState = _bridge.StartQRLogin();
-                if (_currentState == null || string.IsNullOrEmpty(_currentState.QRCodeURL))
+                var unikey = await GetQRKeyAsync();
+                if (string.IsNullOrEmpty(unikey))
                 {
-                    _logger.LogError("[QRLoginManager] 获取二维码失败");
+                    _logger.LogError("[QRLoginManager] 获取二维码 key 失败");
                     OnLoginFailed?.Invoke("获取二维码失败");
                     return false;
                 }
 
-                // 生成二维码图片
+                _uniKey = unikey;
+                _currentState = new NeteaseBridge.QRLoginState
+                {
+                    UniKey = unikey,
+                    QRCodeURL = QRLoginUrlPrefix + unikey,
+                    StatusCode = 801,
+                    StatusMsg = "等待扫码",
+                };
+
                 GenerateQRCodeBytes(_currentState.QRCodeURL);
 
                 OnStatusChanged?.Invoke("请使用网易云音乐 APP 扫码");
                 OnQRCodeUpdated?.Invoke(_qrCodeBytes);
 
-                // 开始轮询
                 _pollingCts = new CancellationTokenSource();
                 _isPolling = true;
-
-                // 启动轮询任务
                 _ = PollLoginStatusAsync(_pollingCts.Token);
 
                 return true;
@@ -110,9 +98,23 @@ namespace OmniMixPlayer.Module.Netease
             }
         }
 
-        /// <summary>
-        /// 轮询登录状态
-        /// </summary>
+        private async Task<string> GetQRKeyAsync()
+        {
+            try
+            {
+                var body = await _http.GetStringAsync(UnikeyUrl).ConfigureAwait(false);
+                var obj = JObject.Parse(body);
+                if (obj["code"]?.Value<int>() != 200) return null;
+                var key = obj["unikey"]?.Value<string>();
+                return string.IsNullOrEmpty(key) ? null : key;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"[QRLoginManager] GetQRKeyAsync exception: {ex.Message}");
+                return null;
+            }
+        }
+
         private async Task PollLoginStatusAsync(CancellationToken cancellationToken)
         {
             try
@@ -122,7 +124,6 @@ namespace OmniMixPlayer.Module.Netease
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    // 检查 2 分钟超时
                     if (DateTime.UtcNow - startTime >= POLLING_TIMEOUT)
                     {
                         _logger.LogInformation("[QRLoginManager] 登录轮询超时，已停止");
@@ -132,16 +133,15 @@ namespace OmniMixPlayer.Module.Netease
                         return;
                     }
 
-                    await Task.Delay(1500, cancellationToken); // 每 1.5 秒检查一次
+                    await Task.Delay(1500, cancellationToken).ConfigureAwait(false);
 
-                    var status = await Task.Run(() => _bridge.CheckQRLoginStatus(), cancellationToken);
+                    var status = await CheckQRStatusAsync().ConfigureAwait(false);
                     if (status == null)
                     {
                         failCount++;
                         _logger.LogWarning($"[QRLoginManager] 检查状态失败 ({failCount})");
                         if (failCount >= 60)
                         {
-                            _logger.LogInformation("[QRLoginManager] 连续失败过多，停止轮询");
                             OnLoginFailed?.Invoke("检查登录状态失败，请刷新重试");
                             return;
                         }
@@ -154,19 +154,26 @@ namespace OmniMixPlayer.Module.Netease
 
                     if (status.IsSuccess)
                     {
-                        _logger.LogInformation("[QRLoginManager] 登录成功！");
+                        var ok = CompleteLogin();
                         _isPolling = false;
-                        OnLoginSuccess?.Invoke();
+                        if (ok)
+                        {
+                            _logger.LogInformation("[QRLoginManager] 登录成功！");
+                            OnLoginSuccess?.Invoke();
+                        }
+                        else
+                        {
+                            _logger.LogWarning("[QRLoginManager] 登录确认完成，但写入 cookie / 刷新用户信息失败");
+                            OnLoginFailed?.Invoke("登录确认完成，但获取用户信息失败，请重试");
+                        }
                         return;
                     }
                     else if (status.IsExpired)
                     {
-                        _logger.LogInformation("[QRLoginManager] 二维码已过期，停止轮询");
                         OnStatusChanged?.Invoke("二维码已过期，请刷新重试");
                         OnLoginFailed?.Invoke("二维码已过期，请刷新重试");
                         return;
                     }
-                    // IsWaitingScan 和 IsWaitingConfirm 继续轮询
                 }
             }
             catch (OperationCanceledException)
@@ -184,15 +191,101 @@ namespace OmniMixPlayer.Module.Netease
             }
         }
 
-        /// <summary>
-        /// 取消登录
-        /// </summary>
+        private async Task<NeteaseBridge.QRLoginState> CheckQRStatusAsync()
+        {
+            try
+            {
+                using var resp = await _http.GetAsync($"{CheckBaseUrl}?key={_uniKey}&type=1").ConfigureAwait(false);
+                var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                var obj = JObject.Parse(body);
+                int code = obj["code"]?.Value<int>() ?? -1;
+                string msg = obj["message"]?.Value<string>() ?? "";
+
+                if (code == 803)
+                {
+                    // 登录成功后 cookie 可能出现在 body 的 cookie 字段，或 Set-Cookie 响应头
+                    _pendingMusicU = ExtractCookieValue(obj["cookie"]?.Value<string>(), "MUSIC_U");
+                    if (_pendingMusicU == null && resp.Headers.TryGetValues("Set-Cookie", out var setCookies))
+                    {
+                        foreach (var c in setCookies)
+                        {
+                            _pendingMusicU = ExtractCookieValue(c, "MUSIC_U");
+                            if (_pendingMusicU != null) break;
+                        }
+                    }
+                }
+
+                return new NeteaseBridge.QRLoginState
+                {
+                    UniKey = _uniKey,
+                    QRCodeURL = "",
+                    StatusCode = code,
+                    StatusMsg = MapStatusMessage(code, msg),
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"[QRLoginManager] CheckQRStatusAsync exception: {ex.Message}");
+                return null;
+            }
+        }
+
+        private bool CompleteLogin()
+        {
+            if (string.IsNullOrEmpty(_pendingMusicU))
+            {
+                _logger.LogWarning("[QRLoginManager] 803 响应中未找到 MUSIC_U cookie");
+                return false;
+            }
+
+            if (!_bridge.SetCookie("MUSIC_U=" + _pendingMusicU))
+            {
+                _logger.LogWarning("[QRLoginManager] SetCookie 失败");
+                return false;
+            }
+
+            var refresh = _bridge.RefreshLogin();
+            if (refresh != NeteaseBridge.RefreshLoginResult.Success)
+            {
+                _logger.LogWarning($"[QRLoginManager] RefreshLogin 失败: {refresh}");
+                return false;
+            }
+
+            return true;
+        }
+
+        private static string ExtractCookieValue(string cookieLine, string name)
+        {
+            if (string.IsNullOrEmpty(cookieLine)) return null;
+            foreach (var rawPart in cookieLine.Split(';'))
+            {
+                var part = rawPart.Trim();
+                if (part.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+                {
+                    var value = part.Substring(name.Length + 1).Trim();
+                    return string.IsNullOrEmpty(value) ? null : value;
+                }
+            }
+            return null;
+        }
+
+        private static string MapStatusMessage(int code, string fallback)
+        {
+            switch (code)
+            {
+                case 800: return "二维码已失效";
+                case 801: return "等待扫码";
+                case 802: return "已扫码，等待确认";
+                case 803: return "登录成功";
+                default: return string.IsNullOrEmpty(fallback) ? ("未知状态: " + code) : fallback;
+            }
+        }
+
         public void CancelLogin()
         {
             CancelPolling();
-            _bridge.CancelQRLogin();
             _currentState = null;
-
+            _uniKey = null;
             CleanupQRCodeResources();
         }
 
@@ -207,17 +300,12 @@ namespace OmniMixPlayer.Module.Netease
             _isPolling = false;
         }
 
-        /// <summary>
-        /// 清理二维码资源
-        /// </summary>
         private void CleanupQRCodeResources()
         {
             _qrCodeBytes = null;
+            _pendingMusicU = null;
         }
 
-        /// <summary>
-        /// 生成二维码字节数据
-        /// </summary>
         private void GenerateQRCodeBytes(string url)
         {
             try
